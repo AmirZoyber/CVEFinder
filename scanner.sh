@@ -1,24 +1,15 @@
 #!/usr/bin/env bash
-# recon_switches_longopts.sh
-# Usage: ./recon_switches_longopts.sh --targets <file> [--nmap] [--nuclei] [--nikto] [--exploit] [--full]
+# recon_no_getopt.sh
+# Usage: ./recon_no_getopt.sh --targets <file> [--nmap] [--nuclei] [--nikto] [--exploit] [--full] [--help]
 #
-# Long options:
-#   --targets <file>   : targets file (one domain or IP per line) - required
-#   --nmap             : run nmap port & service scan
-#   --nuclei           : run nuclei on HTTP endpoints
-#   --nikto            : run nikto on HTTP endpoints
-#   --exploit          : run exploit-finding (searchsploit + msf search). If enabled, --nmap and --nikto are forced on.
-#   --full             : enable all modules (nmap + nuclei + nikto + exploit-finding)
-#   --help             : show help
+# Long options parser implemented manually (no getopt required).
+# Comments in English.
 #
-# IMPORTANT:
-#  - Only run against targets you own or have explicit permission to test.
-#  - This script will NOT execute exploits; it only searches for matching exploits/modules.
 set -euo pipefail
 IFS=$'\n\t'
 
 # -------------------------
-# Defaults
+# Defaults / flags
 # -------------------------
 TARGETS_FILE=""
 DO_NMAP=false
@@ -28,7 +19,7 @@ DO_EXPLOITS=false
 DO_FULL=false
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-OUTDIR="recon_switches_${TIMESTAMP}"
+OUTDIR="recon_no_getopt_${TIMESTAMP}"
 mkdir -p "${OUTDIR}"
 
 # -------------------------
@@ -43,7 +34,7 @@ Options:
   --nmap             Run nmap port & service scan
   --nuclei           Run nuclei on HTTP endpoints
   --nikto            Run nikto on HTTP endpoints
-  --exploit          Run exploit-finding (searchsploit + msf). This will enable --nmap and --nikto automatically.
+  --exploit          Run exploit-finding (searchsploit + msf search). This will enable --nmap and --nikto automatically.
   --full             Enable all (nmap + nuclei + nikto + exploit-finding)
   --help             Show this help
 
@@ -54,59 +45,75 @@ EOF
 }
 
 # -------------------------
-# Parse long options with getopt
+# Simple manual long option parser (no getopt)
 # -------------------------
-# Use GNU getopt for long options parsing
-if ! getopt --test >/dev/null 2>&1; then
-  echo "[!] getopt not available or doesn't support long options. Install util-linux or use shell with getopt." >&2
-  exit 1
-fi
-
-OPTIONS=$(getopt -o '' -l targets:,nmap,nuclei,nikto,exploit,full,help -- "$@")
-if [[ $? -ne 0 ]]; then
-  usage
-  exit 2
-fi
-eval set -- "${OPTIONS}"
-
-while true; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    --targets) TARGETS_FILE="$2"; shift 2 ;;
-    --nmap) DO_NMAP=true; shift ;;
-    --nuclei) DO_NUCLEI=true; shift ;;
-    --nikto) DO_NIKTO=true; shift ;;
-    --exploit) DO_EXPLOITS=true; shift ;;
-    --full) DO_FULL=true; shift ;;
-    --help) usage; exit 0 ;;
-    --) shift; break ;;
-    *) echo "Internal error while parsing options"; exit 3 ;;
+    --targets)
+      if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+        echo "Error: --targets requires a value" >&2
+        usage
+        exit 1
+      fi
+      TARGETS_FILE="$2"
+      shift 2
+      ;;
+    --nmap)
+      DO_NMAP=true
+      shift
+      ;;
+    --nuclei)
+      DO_NUCLEI=true
+      shift
+      ;;
+    --nikto)
+      DO_NIKTO=true
+      shift
+      ;;
+    --exploit)
+      DO_EXPLOITS=true
+      shift
+      ;;
+    --full)
+      DO_FULL=true
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
   esac
 done
 
-# apply --full
+# Apply full
 if [[ "${DO_FULL}" == true ]]; then
   DO_NMAP=true; DO_NUCLEI=true; DO_NIKTO=true; DO_EXPLOITS=true
 fi
 
-# if exploit-finding enabled, enforce nmap and nikto
+# If exploit requested, force required modules
 if [[ "${DO_EXPLOITS}" == true ]]; then
   DO_NMAP=true
   DO_NIKTO=true
 fi
 
+# Validate targets file
 if [[ -z "${TARGETS_FILE}" ]]; then
   echo "[!] targets file required (--targets)." >&2
   usage
-  exit 4
+  exit 2
 fi
-
 if [[ ! -f "${TARGETS_FILE}" ]]; then
   echo "[!] targets file '${TARGETS_FILE}' not found." >&2
-  exit 5
+  exit 3
 fi
 
 # -------------------------
-# Tool checks (only check tools we will use)
+# Tool checks (only for selected options)
 # -------------------------
 REQUIRED_TOOLS=(subfinder dnsx httpx)
 if [[ "${DO_NMAP}" == true ]]; then REQUIRED_TOOLS+=(nmap); fi
@@ -123,11 +130,11 @@ done
 if (( ${#MISSING[@]} )); then
   echo "[!] Missing required tools for selected options: ${MISSING[*]}" >&2
   echo "    Install them and re-run." >&2
-  exit 6
+  exit 4
 fi
 
 # -------------------------
-# Filenames
+# File layout
 # -------------------------
 RAW="${OUTDIR}/raw_targets.txt"
 DOMAINS="${OUTDIR}/domains.txt"
@@ -149,7 +156,6 @@ mkdir -p "${NMAP_DIR}" "${NUCLEI_DIR}" "${NIKTO_DIR}" "${EXPLOITS_DIR}"
 # -------------------------
 # Step 0: sanitize input
 # -------------------------
-# remove comments/blank lines from targets file
 grep -E -v '^\s*#' "${TARGETS_FILE}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E -v '^$' > "${RAW}"
 
 # split ips/domains
@@ -163,7 +169,7 @@ while read -r entry; do
 done < "${RAW}"
 
 # -------------------------
-# Step 1: subdomain discovery (if domains present)
+# Step 1: subdomain discovery
 # -------------------------
 if [[ -s "${DOMAINS}" ]]; then
   echo "[*] Running subfinder..."
@@ -172,18 +178,17 @@ else
   echo "[*] No domains to run subfinder on."
 fi
 
-# combine originals + discovered
 cat "${DOMAINS}" "${SUBS}" 2>/dev/null | sort -u > "${COMBINED}" || true
 
 # -------------------------
-# Step 2: resolve hosts with dnsx (produce host|ip pairs)
+# Step 2: resolve hosts with dnsx (host|ip)
 # -------------------------
 if [[ -s "${COMBINED}" ]]; then
   echo "[*] Resolving domains with dnsx..."
   dnsx -a -silent -l "${COMBINED}" | awk '{print $1 "|" $2 }' | sort -u > "${RESOLVED}"
 fi
 
-# include raw IPs from input as host|ip
+# include raw IPs as host|ip
 if [[ -s "${IPS}" ]]; then
   while read -r ip; do
     [[ -z "$ip" ]] && continue
@@ -195,7 +200,7 @@ fi
 sort -u "${RESOLVED}" -o "${RESOLVED}" || true
 
 # -------------------------
-# Step 3: probe HTTP endpoints with httpx (required for nuclei/nikto)
+# Step 3: probe HTTP endpoints with httpx (for nuclei/nikto)
 # -------------------------
 cut -d'|' -f1 "${RESOLVED}" | sort -u > "${OUTDIR}/hosts_list.tmp" || true
 echo "[*] Probing HTTP endpoints with httpx..."
@@ -203,7 +208,7 @@ if [[ -s "${OUTDIR}/hosts_list.tmp" ]]; then
   httpx -silent -l "${OUTDIR}/hosts_list.tmp" -threads 50 -status-code -o "${HTTP_URLS}" || true
 fi
 
-# if httpx produced nothing, synthesize candidates for nikto/nuclei
+# synthesize http/https candidates if httpx empty
 if [[ ! -s "${HTTP_URLS}" ]]; then
   echo "[*] httpx returned no live URLs; producing http/https candidates..."
   > "${HTTP_URLS}"
@@ -221,7 +226,7 @@ if [[ ! -s "${HTTP_URLS}" ]]; then
 fi
 
 # -------------------------
-# Step 4: run nuclei (if requested)
+# Step 4: nuclei
 # -------------------------
 if [[ "${DO_NUCLEI}" == true ]]; then
   echo "[*] Running nuclei..."
@@ -232,7 +237,7 @@ if [[ "${DO_NUCLEI}" == true ]]; then
 fi
 
 # -------------------------
-# Step 5: run nikto (if requested)
+# Step 5: nikto
 # -------------------------
 if [[ "${DO_NIKTO}" == true ]]; then
   echo "[*] Running nikto on HTTP endpoints..."
@@ -249,7 +254,7 @@ if [[ "${DO_NIKTO}" == true ]]; then
 fi
 
 # -------------------------
-# Step 6: run nmap (if requested)
+# Step 6: nmap
 # -------------------------
 TARGET_IPS="${OUTDIR}/target_ips.txt"
 cut -d'|' -f2 "${RESOLVED}" | sort -u > "${TARGET_IPS}" || true
@@ -278,7 +283,7 @@ if [[ "${DO_NMAP}" == true ]]; then
 fi
 
 # -------------------------
-# Step 7: extract services and CVEs from nmap outputs (if nmap ran)
+# Step 7: parse nmap + collect CVEs
 # -------------------------
 > "${SERVICES_FILE}"
 > "${CVES_FILE}"
@@ -305,7 +310,7 @@ if [[ "${DO_NMAP}" == true ]]; then
   sort -u "${CVES_FILE}" -o "${CVES_FILE}" || true
 fi
 
-# include CVEs from nuclei outputs if nuclei ran
+# extract CVEs from nuclei
 if [[ "${DO_NUCLEI}" == true ]]; then
   if [[ -f "${NUCLEI_DIR}/nuclei_results.jsonl" ]]; then
     echo "[*] Extracting CVEs from nuclei output..."
@@ -319,7 +324,7 @@ if [[ "${DO_NUCLEI}" == true ]]; then
 fi
 
 # -------------------------
-# Step 8: exploit-finding (searchsploit + msf) if requested
+# Step 8: exploit-finding (searchsploit + msf)
 # -------------------------
 if [[ "${DO_EXPLOITS}" == true ]]; then
   echo "[*] Running exploit-finding (searchsploit + msf searches)..."
@@ -327,7 +332,6 @@ if [[ "${DO_EXPLOITS}" == true ]]; then
   MSF_SUM="${EXPLOITS_DIR}/msf_summary.txt"
   > "${SS_SUM}"; > "${MSF_SUM}"
 
-  # searchsploit for discovered services and CVEs
   if [[ -s "${SERVICES_FILE}" ]]; then
     while IFS='|' read -r ip port proto service version; do
       [[ -z "${service}" ]] && continue
@@ -358,7 +362,6 @@ if [[ "${DO_EXPLOITS}" == true ]]; then
     done < "${SERVICES_FILE}"
   fi
 
-  # searchsploit by CVE
   if [[ -s "${CVES_FILE}" ]]; then
     while read -r cve; do
       [[ -z "$cve" ]] && continue
@@ -373,7 +376,7 @@ if [[ "${DO_EXPLOITS}" == true ]]; then
     done < "${CVES_FILE}"
   fi
 
-  # Metasploit search (non-interactive)
+  # Metasploit search
   if [[ -s "${CVES_FILE}" ]]; then
     while read -r cve; do
       [[ -z "$cve" ]] && continue
