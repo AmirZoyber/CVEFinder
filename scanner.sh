@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# recon_no_getopt.sh
-# Usage: ./recon_no_getopt.sh --targets <file> [--nmap] [--nuclei] [--nikto] [--exploit] [--full] [--help]
+# scanner_fixed.sh
+# Usage: sudo ./scanner_fixed.sh --targets <file> [--nmap] [--nuclei] [--nikto] [--exploit] [--full] [--help]
 #
-# Long options parser implemented manually (no getopt required).
-# Comments in English.
+# Manual long-option parser (no getopt required).
+# Fixes:
+#  - Nmap options are passed as an array to avoid word-splitting/quoting issues.
+#  - httpx invocation tries multiple common flag combinations and falls back to synthesized URLs.
 #
 set -euo pipefail
 IFS=$'\n\t'
@@ -19,7 +21,7 @@ DO_EXPLOITS=false
 DO_FULL=false
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-OUTDIR="recon_no_getopt_${TIMESTAMP}"
+OUTDIR="recon_fixed_${TIMESTAMP}"
 mkdir -p "${OUTDIR}"
 
 # -------------------------
@@ -45,7 +47,7 @@ EOF
 }
 
 # -------------------------
-# Simple manual long option parser (no getopt)
+# Simple manual long option parser
 # -------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,7 +92,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Apply full
+# Apply --full
 if [[ "${DO_FULL}" == true ]]; then
   DO_NMAP=true; DO_NUCLEI=true; DO_NIKTO=true; DO_EXPLOITS=true
 fi
@@ -115,7 +117,11 @@ fi
 # -------------------------
 # Tool checks (only for selected options)
 # -------------------------
-REQUIRED_TOOLS=(subfinder dnsx httpx)
+REQUIRED_TOOLS=(subfinder dnsx)
+# httpx optional but we will try to use it if present
+if command -v httpx >/dev/null 2>&1; then
+  REQUIRED_TOOLS+=(httpx)
+fi
 if [[ "${DO_NMAP}" == true ]]; then REQUIRED_TOOLS+=(nmap); fi
 if [[ "${DO_NUCLEI}" == true ]]; then REQUIRED_TOOLS+=(nuclei); fi
 if [[ "${DO_NIKTO}" == true ]]; then REQUIRED_TOOLS+=(nikto); fi
@@ -130,6 +136,7 @@ done
 if (( ${#MISSING[@]} )); then
   echo "[!] Missing required tools for selected options: ${MISSING[*]}" >&2
   echo "    Install them and re-run." >&2
+  # Note: we don't force-exit if httpx missing; httpx already included in REQUIRED_TOOLS conditionally
   exit 4
 fi
 
@@ -173,7 +180,7 @@ done < "${RAW}"
 # -------------------------
 if [[ -s "${DOMAINS}" ]]; then
   echo "[*] Running subfinder..."
-  subfinder -dL "${DOMAINS}" -silent -o "${SUBS}" || true
+  subfinder -dL "${DOMAINS}" -silent -o "${SUBS}" 2>/dev/null || true
 else
   echo "[*] No domains to run subfinder on."
 fi
@@ -185,7 +192,7 @@ cat "${DOMAINS}" "${SUBS}" 2>/dev/null | sort -u > "${COMBINED}" || true
 # -------------------------
 if [[ -s "${COMBINED}" ]]; then
   echo "[*] Resolving domains with dnsx..."
-  dnsx -a -silent -l "${COMBINED}" | awk '{print $1 "|" $2 }' | sort -u > "${RESOLVED}"
+  dnsx -a -silent -l "${COMBINED}" | awk '{print $1 "|" $2 }' | sort -u > "${RESOLVED}" || true
 fi
 
 # include raw IPs as host|ip
@@ -200,17 +207,71 @@ fi
 sort -u "${RESOLVED}" -o "${RESOLVED}" || true
 
 # -------------------------
+# Helper: try httpx with different flag variants
+# -------------------------
+run_httpx() {
+  # $1 = input hosts file
+  # $2 = output file
+  local in="$1"
+  local out="$2"
+  # try variant 1: common PD httpx form (short -l, long --silent)
+  if command -v httpx >/dev/null 2>&1; then
+    echo "[*] Trying httpx variant: httpx -l <file> --silent -threads 50 -status-code -o <out>"
+    set +e
+    httpx -l "${in}" --silent -threads 50 -status-code -o "${out}" 2> "${OUTDIR}/httpx_try1.err"
+    rc=$?
+    set -e
+    if [[ ${rc} -eq 0 && -s "${out}" ]]; then
+      echo "[*] httpx variant1 succeeded -> ${out}"
+      return 0
+    fi
+
+    # try variant 2: older/alternate forms (single-dash long-word)
+    echo "[*] Trying httpx variant: httpx -l <file> -silent -threads 50 -status-code -o <out>"
+    set +e
+    httpx -l "${in}" -silent -threads 50 -status-code -o "${out}" 2> "${OUTDIR}/httpx_try2.err"
+    rc=$?
+    set -e
+    if [[ ${rc} -eq 0 && -s "${out}" ]]; then
+      echo "[*] httpx variant2 succeeded -> ${out}"
+      return 0
+    fi
+
+    # try variant 3: minimal (just -l and --silent)
+    echo "[*] Trying httpx minimal variant: httpx -l <file> --silent -o <out>"
+    set +e
+    httpx -l "${in}" --silent -o "${out}" 2> "${OUTDIR}/httpx_try3.err"
+    rc=$?
+    set -e
+    if [[ ${rc} -eq 0 && -s "${out}" ]]; then
+      echo "[*] httpx minimal succeeded -> ${out}"
+      return 0
+    fi
+
+    # all attempts failed
+    echo "[!] httpx attempts failed. Check ${OUTDIR}/httpx_try1.err ${OUTDIR}/httpx_try2.err ${OUTDIR}/httpx_try3.err for details."
+    return 1
+  else
+    echo "[*] httpx not installed; skipping httpx probing."
+    return 1
+  fi
+}
+
+# -------------------------
 # Step 3: probe HTTP endpoints with httpx (for nuclei/nikto)
 # -------------------------
 cut -d'|' -f1 "${RESOLVED}" | sort -u > "${OUTDIR}/hosts_list.tmp" || true
 echo "[*] Probing HTTP endpoints with httpx..."
+HTTPX_SUCCESS=false
 if [[ -s "${OUTDIR}/hosts_list.tmp" ]]; then
-  httpx -silent -l "${OUTDIR}/hosts_list.tmp" -threads 50 -status-code -o "${HTTP_URLS}" || true
+  if run_httpx "${OUTDIR}/hosts_list.tmp" "${HTTP_URLS}"; then
+    HTTPX_SUCCESS=true
+  fi
 fi
 
-# synthesize http/https candidates if httpx empty
-if [[ ! -s "${HTTP_URLS}" ]]; then
-  echo "[*] httpx returned no live URLs; producing http/https candidates..."
+# synthesize http/https candidates if httpx empty or failed
+if [[ "${HTTPX_SUCCESS}" != true || ! -s "${HTTP_URLS}" ]]; then
+  echo "[*] httpx returned no live URLs or not available; producing http/https candidates..."
   > "${HTTP_URLS}"
   while IFS='|' read -r host ip; do
     [[ -z "${host}" ]] && continue
@@ -222,7 +283,7 @@ if [[ ! -s "${HTTP_URLS}" ]]; then
     echo "http://${ip}" >> "${HTTP_URLS}"
     echo "https://${ip}" >> "${HTTP_URLS}"
   done < "${IPS}" 2>/dev/null || true
-  sort -u -o "${HTTP_URLS}" "${HTTP_URLS}"
+  sort -u -o "${HTTP_URLS}" "${HTTP_URLS}" || true
 fi
 
 # -------------------------
@@ -254,14 +315,15 @@ if [[ "${DO_NIKTO}" == true ]]; then
 fi
 
 # -------------------------
-# Step 6: nmap
+# Step 6: nmap (use array for options to preserve word splitting)
 # -------------------------
 TARGET_IPS="${OUTDIR}/target_ips.txt"
 cut -d'|' -f2 "${RESOLVED}" | sort -u > "${TARGET_IPS}" || true
 
 if [[ "${DO_NMAP}" == true ]]; then
   echo "[*] Running nmap scans..."
-  NMAP_COMMON="-Pn -sS -p- -sV --open -T4 --min-rate 500"
+  # use array to avoid quoting issues
+  NMAP_COMMON=( -Pn -sS -p- -sV --open -T4 --min-rate 500 )
   if nmap --script-help vulners >/dev/null 2>&1; then
     NMAP_SCRIPTS="vuln,vulners"
   else
@@ -274,9 +336,10 @@ if [[ "${DO_NMAP}" == true ]]; then
     outbase="${NMAP_DIR}/${safe}"
     if [[ $EUID -ne 0 ]]; then
       echo "    [!] Not root - using -sT for ${ip}"
-      nmap ${NMAP_COMMON} -sT --script="${NMAP_SCRIPTS}" -oA "${outbase}" "${ip}" || true
+      # pass array and then add -sT (note: -sT replaces -sS)
+      nmap "${NMAP_COMMON[@]/-sS/-sT}" --script="${NMAP_SCRIPTS}" -oA "${outbase}" "${ip}" || true
     else
-      nmap ${NMAP_COMMON} --script="${NMAP_SCRIPTS}" -oA "${outbase}" "${ip}" || true
+      nmap "${NMAP_COMMON[@]}" --script="${NMAP_SCRIPTS}" -oA "${outbase}" "${ip}" || true
     fi
   done < "${TARGET_IPS}"
   echo "[*] nmap scans finished. outputs in ${NMAP_DIR}"
@@ -376,7 +439,7 @@ if [[ "${DO_EXPLOITS}" == true ]]; then
     done < "${CVES_FILE}"
   fi
 
-  # Metasploit search
+  # Metasploit search (non-interactive)
   if [[ -s "${CVES_FILE}" ]]; then
     while read -r cve; do
       [[ -z "$cve" ]] && continue
