@@ -1,172 +1,141 @@
 #!/usr/bin/env bash
+# nscan.sh - simple wrapper around nmap to parse ports into "port/tcp" "port/udp" lines
+# Usage examples:
+#   ./nscan.sh -t 1.2.3.4 -T            # tcp scan
+#   ./nscan.sh -t example.com -U --delay 200   # udp scan with 200ms scan-delay
+#   ./nscan.sh -t 1.2.3.4 -TU -o out.txt       # both, write raw nmap output to out.txt and print ports
+#   ./nscan.sh -t 1.2.3.4 -TU -o out.txt --scilent  # write but don't print
+
 set -euo pipefail
 
-# nmap_ports.sh
-# Usage:
-#   sudo ./nmap_ports.sh -t <target> [-p <ports>] [-o <out-file>] [-T] [-U] [-r <pps>] [-d <delay>]
-#
-# Options:
-#   -t <target>     Target IP / CIDR / hostname (required)
-#   -p <ports>      Port range (default: 1-65535)
-#   -o <out-file>   File to write discovered ports (default: nmap_open_ports.txt)
-#   -T              Scan TCP using -sT
-#   -U              Scan UDP using -sU
-#                   If neither -T nor -U provided, defaults to TCP (-T).
-#   -r <pps>        Rate in packets-per-second: sets --min-rate <pps> --max-rate <pps>
-#   -d <delay>      Delay between probes: sets --scan-delay <time> (e.g. 200ms, 1s)
-# Examples:
-#   sudo ./nmap_ports.sh -t 198.51.100.5 -T
-#   sudo ./nmap_ports.sh -t 198.51.100.0/24 -U -p 53 -r 50
-#   sudo ./nmap_ports.sh -t example.com -T -U -r 20 -d 200ms -o out.txt
-
-TARGET=""
-PORTS="1-65535"
-OUTFILE="nmap_open_ports.txt"
-SCAN_TCP=false
-SCAN_UDP=false
-RATE=""
-DELAY=""
-
-print_usage() {
+print_help() {
   cat <<EOF
-Usage: $0 -t <target> [-p <ports>] [-o <out-file>] [-T] [-U] [-r <pps>] [-d <delay>]
+nscan.sh - minimal wrapper for nmap that prints only ports as "port/tcp" or "port/udp"
 
-  -t target       (required) IP/CIDR/hostname
-  -p ports        ports to scan (default: ${PORTS})
-  -o out-file     output file (default: ${OUTFILE})
-  -T              TCP scan (uses -sT)
-  -U              UDP scan (uses -sU)
-  -r pps          packets-per-second rate (sets --min-rate and --max-rate)
-  -d delay        scan-delay between probes (e.g. 100ms, 1s) -> sets --scan-delay
-
-Notes:
- - UDP scans are slow and unreliable at large scale. Prefer limiting ports when using -sU.
- - Use sudo for best results.
- - Example delay formats: 200ms, 1s, 500ms
+Options:
+  -t, --target <target>      Target host or network (required)
+  -T, --tcp                  Do a TCP scan (-sT)
+  -U, --udp                  Do a UDP scan (-sU)
+  -TU                        Do both TCP and UDP
+  --delay <ms>               Pass a scan delay to nmap as --scan-delay <ms> (milliseconds)
+  -o <file>                  Save raw nmap output to <file> (also prints parsed ports unless --scilent)
+  --scilent                  If present, suppress printing parsed ports to stdout (file still written if -o used)
+  -h, --help                 Show this help
 EOF
 }
 
-while getopts "t:p:o:TUr:d:h" opt; do
-  case "$opt" in
-    t) TARGET="$OPTARG" ;;
-    p) PORTS="$OPTARG" ;;
-    o) OUTFILE="$OPTARG" ;;
-    T) SCAN_TCP=true ;;
-    U) SCAN_UDP=true ;;
-    r) RATE="$OPTARG" ;;
-    d) DELAY="$OPTARG" ;;
-    h) print_usage; exit 0 ;;
-    *) print_usage; exit 1 ;;
+# defaults
+TARGET=""
+DO_TCP=false
+DO_UDP=false
+DELAY=""
+OUTFILE=""
+SCILENT=false
+
+# parse args (supports long and short)
+if [ $# -eq 0 ]; then
+  print_help
+  exit 1
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--target)
+      TARGET="$2"; shift 2 ;;
+    -T|--tcp)
+      DO_TCP=true; shift ;;
+    -U|--udp)
+      DO_UDP=true; shift ;;
+    -TU)
+      DO_TCP=true; DO_UDP=true; shift ;;
+    --delay)
+      # expect milliseconds like 100 or 200ms (we'll append ms if user gave a number)
+      raw="$2"
+      if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        DELAY="${raw}ms"
+      else
+        DELAY="$raw"
+      fi
+      shift 2 ;;
+    -o)
+      OUTFILE="$2"; shift 2 ;;
+    --scilent)
+      SCILENT=true; shift ;;
+    -h|--help)
+      print_help; exit 0 ;;
+    *)
+      echo "unknown option: $1"; print_help; exit 2 ;;
   esac
 done
 
-if [[ -z "$TARGET" ]]; then
-  echo "ERROR: target (-t) is required."
-  print_usage
+# validation
+if [ -z "$TARGET" ]; then
+  echo "error: target is required (-t | --target)." >&2
+  exit 2
+fi
+if [ "$DO_TCP" = false ] && [ "$DO_UDP" = false ]; then
+  echo "error: at least one of TCP or UDP must be requested (-T/--tcp, -U/--udp, or -TU)." >&2
   exit 2
 fi
 
-# default to TCP if neither given
-if ! $SCAN_TCP && ! $SCAN_UDP; then
-  SCAN_TCP=true
+# check nmap exists
+if ! command -v nmap >/dev/null 2>&1; then
+  echo "error: nmap not found in PATH." >&2
+  exit 3
 fi
 
-# build rate/delay options for nmap
-RATE_OPTS=""
-if [[ -n "$RATE" ]]; then
-  # basic validation: RATE should be a positive integer
-  if ! [[ "$RATE" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: rate (-r) must be a positive integer (packets per second)."
-    exit 3
-  fi
-  RATE_OPTS="--min-rate ${RATE} --max-rate ${RATE}"
+# build nmap command
+NMAP_OPTS=()
+if [ "$DO_TCP" = true ]; then
+  NMAP_OPTS+=("-sT")
+fi
+if [ "$DO_UDP" = true ]; then
+  NMAP_OPTS+=("-sU")
+fi
+# quiet-ish nmap output (but keep useful info)
+NMAP_OPTS+=("-Pn")   # skip host discovery to speed things and avoid blocking (adjust if you don't want this)
+# user-provided delay
+if [ -n "$DELAY" ]; then
+  NMAP_OPTS+=("--scan-delay" "$DELAY")
 fi
 
-DELAY_OPTS=""
-if [[ -n "$DELAY" ]]; then
-  # don't attempt to validate time format here too strictly; nmap accepts values like "200ms" or "1s"
-  DELAY_OPTS="--scan-delay ${DELAY}"
+# temp file for raw output
+TMP=$(mktemp /tmp/nscan.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+
+# run nmap
+echo "running nmap on ${TARGET}..." >&2
+nmap "${NMAP_OPTS[@]}" "$TARGET" -oN "$TMP" >/dev/null 2>&1 || true
+# note: we capture output in $TMP even if nmap exits non-zero (e.g., no UDP privileges); continue to parsing
+
+# if outfile requested, write raw nmap output there
+if [ -n "$OUTFILE" ]; then
+  cp "$TMP" "$OUTFILE"
+  echo "raw nmap output written to: $OUTFILE" >&2
 fi
 
-# temp file for nmap raw output
-TMPOUT="$(mktemp /tmp/nmap_raw.XXXXXX)"
-trap 'rm -f "$TMPOUT"' EXIT
+# parse ports lines from nmap normal output
+# nmap normal output shows a table section like:
+# PORT     STATE  SERVICE
+# 22/tcp   open   ssh
+# 53/udp   open   domain
+# We'll capture lines that look like 'number/(tcp|udp)' at line start
+PORT_LINES=$(grep -E '^[0-9]+/(tcp|udp)' "$TMP" || true)
 
-echo "Target: $TARGET"
-echo "Ports: $PORTS"
-echo -n "Mode: "
-if $SCAN_TCP && $SCAN_UDP; then MODE="both"; echo "both (TCP & UDP)"
-elif $SCAN_UDP; then MODE="udp"; echo "UDP only"
-else MODE="tcp"; echo "TCP only"; fi
-
-if [[ -n "$RATE" ]]; then echo "Rate: ${RATE} pps (min/max rate)"; fi
-if [[ -n "$DELAY" ]]; then echo "Delay: ${DELAY} (scan-delay)"; fi
-echo "Raw nmap output -> $TMPOUT"
-echo
-
-# helper to run nmap and append to TMPOUT
-# Using -sT for TCP, -sU for UDP. We include -Pn to avoid host discovery failure on firewalled hosts.
-run_nmap() {
-  local proto="$1"   # "tcp" or "udp"
-  local scan_opts="$2"
-  local label="$3"
-  echo "=== Starting nmap $label scan ($proto) at $(date -u +"%Y-%m-%d %H:%M:%S UTC") ===" | tee -a "$TMPOUT"
-  # Note: sudo is used to allow raw sockets where needed. Remove if you prefer non-privileged runs.
-  sudo nmap -p "${PORTS}" ${scan_opts} "${TARGET}" -oN - 2>&1 | tee -a "$TMPOUT"
-  echo "=== Finished nmap $label scan ($proto) at $(date -u +"%Y-%m-%d %H:%M:%S UTC") ===" | tee -a "$TMPOUT"
-  echo >> "$TMPOUT"
-}
-
-# Build options for each proto
-TCP_OPTS="-sT -Pn ${RATE_OPTS} ${DELAY_OPTS}"
-UDP_OPTS="-sU -Pn ${RATE_OPTS} ${DELAY_OPTS}"
-
-# Run scans
-if $SCAN_TCP && $SCAN_UDP; then
-  run_nmap "tcp" "${TCP_OPTS}" "TCP"
-  run_nmap "udp" "${UDP_OPTS}" "UDP"
-elif $SCAN_UDP; then
-  run_nmap "udp" "${UDP_OPTS}" "UDP"
-else
-  run_nmap "tcp" "${TCP_OPTS}" "TCP"
-fi
-
-# Parse TMPOUT for open ports.
-# nmap prints lines like:
-#   80/tcp   open  http
-#   53/udp   open  domain
-# We'll extract fields that match "<port>/<proto>  open" (case-insensitive).
-if [[ "$MODE" == "both" ]]; then
-  # output port/proto (e.g. 53/udp)
-  awk 'BEGIN{IGNORECASE=1}
-    /^[0-9]+\/(tcp|udp)[[:space:]]+open/ {
-      gsub(/\r/,"",$1);
-      print $1
-    }' "$TMPOUT" | sort -V -u > "$OUTFILE"
-else
-  # single protocol: output numeric ports only
-  awk 'BEGIN{IGNORECASE=1}
-    /^[0-9]+\/(tcp|udp)[[:space:]]+open/ {
-      split($1,a,"/");
-      print a[1]
-    }' "$TMPOUT" | sort -n -u > "$OUTFILE"
-fi
-
-# Final report
-if [[ -s "$OUTFILE" ]]; then
-  echo
-  echo "Saved discovered open ports to: $OUTFILE"
-  echo "----"
-  cat "$OUTFILE"
-  echo "----"
-  if [[ "$MODE" == "both" ]]; then
-    echo "(format: port/protocol)"
-  else
-    echo "(format: port)"
+# produce final port list: "port/tcp" ...
+# If user asked not to print (scilent), we skip printing to stdout.
+if [ -z "$PORT_LINES" ]; then
+  # no ports found
+  if [ "$SCILENT" = false ]; then
+    # still print nothing but exit success
+    :
   fi
 else
-  echo
-  echo "No open ports found (no matching 'open' lines parsed in nmap output)."
-  # ensure outfile exists (empty)
-  : > "$OUTFILE"
+  # extract first column (port/proto)
+  if [ "$SCILENT" = false ]; then
+    echo "$PORT_LINES" | awk '{print $1}'
+  fi
 fi
+
+# exit
+exit 0
