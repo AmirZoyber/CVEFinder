@@ -20,12 +20,12 @@ DO_TCP=false
 DO_UDP=false
 OUTFILE=""
 SCILENT=false
-MASSCAN_PORTS="1-65535"
+MASSCAN_PORTS="1-65535"   # default if no -p provided
 MASSCAN_RATE="10000"
 
 # new flags
-PORTS_SPEC=""          # user-specified -p
-PORT_SCAN_FLAG=false   # --port-scan
+PORTS_SPEC=""            # user-specified -p (if empty -> scan all ports)
+PORT_SCAN_FLAG=false    # --port-scan
 SERVICE_SCAN_FLAG=false # --service-scan
 
 print_help() {
@@ -39,8 +39,9 @@ Options:
   -TU                      Scan both TCP and UDP
   -p, --ports <ports>      Ports spec: single, comma list, or range e.g. 80  80,443  1-1024  80,443,8000-8100
   --port-scan              If present and no -T/-U/-TU provided, behave like -TU (scan both)
-  --service-scan           Requires -p/--ports and must NOT be used with --port-scan or -T/-U/-TU.
-                           Performs port scan for provided ports, then runs nmap -sV to enumerate services.
+  --service-scan           Performs port scan then nmap -sV service enumeration.
+                           If -p/--ports is omitted, defaults to scanning all ports (1-65535).
+                           Must NOT be combined with --port-scan or -T/-U/-TU.
   -o, --output <file>      Save final ports to <file>
   -s, --scilence           Suppress printing parsed ports to stdout (still writes file if -o given)
   -h, --help               Show this help
@@ -93,32 +94,31 @@ if $PORT_SCAN_FLAG && ! $DO_TCP && ! $DO_UDP; then
   DO_UDP=true
 fi
 
+# If user provided -p, use it; otherwise keep default MASSCAN_PORTS ("1-65535")
+if [ -n "$PORTS_SPEC" ]; then
+  MASSCAN_PORTS="$PORTS_SPEC"
+fi
+
 # service-scan rules:
-# - requires -p
 # - must NOT be used with --port-scan or explicit -T/-U/-TU (we require a clean run: service-scan controls flow)
 if $SERVICE_SCAN_FLAG; then
-  if [ -z "$PORTS_SPEC" ]; then
-    echo "error: --service-scan requires -p|--ports to be specified." >&2
-    exit 2
-  fi
-  # If user provided any explicit scan flags or port-scan, reject to avoid ambiguity
   if $PORT_SCAN_FLAG || $DO_TCP || $DO_UDP; then
-    echo "error: --service-scan must not be combined with --port-scan or -T/-U/-TU. Use only -p and --service-scan." >&2
+    echo "error: --service-scan must not be combined with --port-scan or -T/-U/-TU. Use only -t (target) and optionally -p." >&2
     exit 2
   fi
-  # For service-scan, we'll scan both TCP & UDP ports in the provided spec
+  # For service-scan we always probe both protocols
   DO_TCP=true
   DO_UDP=true
+  # If PORTS_SPEC empty, MASSCAN_PORTS remains "1-65535" so we'll scan all ports
+  if [ -z "$PORTS_SPEC" ]; then
+    log_err() { printf "%s\n" "$*" >&2; } # ensure log_err available
+    log_err "note: --service-scan used without -p; defaulting to all ports (${MASSCAN_PORTS})."
+  fi
 fi
 
 # if neither specified, default to TCP (common expectation)
 if ! $DO_TCP && ! $DO_UDP; then
   DO_TCP=true
-fi
-
-# if -p provided, override masscan default port range for the scan
-if [ -n "$PORTS_SPEC" ]; then
-  MASSCAN_PORTS="$PORTS_SPEC"
 fi
 
 # temp files
@@ -156,13 +156,10 @@ parse_nmap() {
 }
 
 # parse nmap -sV output to get services lines:
-# e.g. "22/tcp open  ssh   OpenSSH 7.6p1" -> prints "22/tcp -> ssh OpenSSH 7.6p1"
 parse_nmap_services() {
   local infile="$1"; local outfile="$2"
-  # lines that start with port/proto
   awk '/^[0-9]+\/(tcp|udp)/ {
     proto=$1;
-    # service is typically $3, banner is fields 4+
     service=$3;
     banner="";
     for(i=4;i<=NF;i++){ banner=banner" "$i }
@@ -172,7 +169,6 @@ parse_nmap_services() {
 }
 
 # run masscan for given proto(s)
-# args: <proto> where proto is "tcp", "udp", or "both"
 run_masscan() {
   local proto="$1"
   local p_arg
@@ -197,12 +193,10 @@ run_masscan() {
 }
 
 # run nmap (we run -oN to capture normal output)
-# nmap_opts constructed by caller
 run_nmap() {
   local -n nmap_opts_ref=$1
   log_err "running nmap on ${TARGET} (opts: ${nmap_opts_ref[*]}) ..."
   if has_cmd nmap; then
-    # capture normal output to file (nmap returns non-zero for some UDP cases; ignore exit code)
     nmap "${nmap_opts_ref[@]}" "${TARGET}" -oN "$NMAP_RAW" >/dev/null 2>&1 || true
   else
     log_err "nmap not found; skipping nmap"
@@ -210,8 +204,7 @@ run_nmap() {
   fi
 }
 
-# run nmap -sV against a list of ports (tcp and/or udp)
-# args: tcp_ports_string, udp_ports_string  (comma separated lists or empty)
+# run nmap -sV against lists of ports
 run_service_nmap() {
   local tcp_ports="$1"
   local udp_ports="$2"
@@ -219,7 +212,6 @@ run_service_nmap() {
   : > "$tmpsvc"
   if [ -n "$tcp_ports" ] && [ "$tcp_ports" != "-" ]; then
     log_err "running nmap -sV (TCP) on ${TARGET} ports=${tcp_ports} ..."
-    # -Pn skip host discovery, -sV service/version, -p ports
     if has_cmd nmap; then
       nmap -Pn -sV -p "${tcp_ports}" "${TARGET}" -oN "$TMPDIR/nmap_sV_tcp.txt" >/dev/null 2>&1 || true
       parse_nmap_services "$TMPDIR/nmap_sV_tcp.txt" "$TMPDIR/nmap_sV_tcp_parsed.txt"
@@ -227,11 +219,9 @@ run_service_nmap() {
     fi
   fi
   if [ -n "$udp_ports" ] && [ "$udp_ports" != "-" ]; then
-    log_err "running nmap -sU -sV (UDP) on ${TARGET} ports=${udp_ports} ... (UDP scans may be slow and require root)"
+    log_err "running nmap -sU -sV (UDP) on ${TARGET} ports=${udp_ports} ... (may require root)"
     if has_cmd nmap; then
-      # UDP may require root; if not root, nmap may fall back but could be less effective
       if [ "$EUID" -ne 0 ]; then
-        # try sudo for UDP service scan
         sudo nmap -Pn -sU -sV -p "${udp_ports}" "${TARGET}" -oN "$TMPDIR/nmap_sV_udp.txt" >/dev/null 2>&1 || true
       else
         nmap -Pn -sU -sV -p "${udp_ports}" "${TARGET}" -oN "$TMPDIR/nmap_sV_udp.txt" >/dev/null 2>&1 || true
@@ -240,7 +230,6 @@ run_service_nmap() {
       cat "$TMPDIR/nmap_sV_udp_parsed.txt" >> "$tmpsvc" || true
     fi
   fi
-  # normalize and unique services
   if [ -s "$tmpsvc" ]; then
     sort -V -u "$tmpsvc" > "$SERVICES_RAW"
   else
@@ -248,14 +237,10 @@ run_service_nmap() {
   fi
 }
 
-# MAIN: choose scanning strategy
+# MAIN
 MASSCAN_AVAILABLE=false
 if has_cmd masscan; then MASSCAN_AVAILABLE=true; fi
 
-# Run scans conditionally
-# We'll create per-source parsed files in TMPDIR and then aggregate
-
-# Reset intermediate parsed files
 : > "$AGG_RAW"
 : > "$SERVICES_RAW"
 
@@ -265,8 +250,6 @@ if $DO_TCP; then
     run_masscan "tcp"
     parse_masscan "$MASSCAN_RAW" "$TMPDIR/masscan_tcp.txt"
   else
-    # fallback to nmap for tcp
-    # run nmap just to get ports (no -sV here unless service-scan later)
     nmap_opts_tcp=()
     nmap_opts_tcp+=("-sT")
     nmap_opts_tcp+=("-Pn")
@@ -281,10 +264,8 @@ fi
 # For UDP:
 if $DO_UDP; then
   if $MASSCAN_AVAILABLE; then
-    # try masscan udp then also run nmap for UDP accuracy
     run_masscan "udp"
     parse_masscan "$MASSCAN_RAW" "$TMPDIR/masscan_udp.txt"
-    # nmap UDP probe (no -sV, except when service-scan will later run -sU -sV)
     nmap_opts_udp=()
     nmap_opts_udp+=("-sU")
     nmap_opts_udp+=("-Pn")
@@ -294,7 +275,6 @@ if $DO_UDP; then
     run_nmap nmap_opts_udp
     parse_nmap "$NMAP_RAW" "$TMPDIR/nmap_udp.txt"
   else
-    # use nmap only for udp
     nmap_opts_udp=()
     nmap_opts_udp+=("-sU")
     nmap_opts_udp+=("-Pn")
@@ -306,28 +286,22 @@ if $DO_UDP; then
   fi
 fi
 
-# Collect parsed results into AGG_RAW, normalize so all lines are like "port/tcp" or "port/udp"
-# masscan tcp
+# Aggregate parsed results
 if [ -f "$TMPDIR/masscan_tcp.txt" ] && [ -s "$TMPDIR/masscan_tcp.txt" ]; then
   awk -F'/' '{print $1 "/tcp"}' "$TMPDIR/masscan_tcp.txt" >> "$AGG_RAW"
 fi
-# masscan udp
 if [ -f "$TMPDIR/masscan_udp.txt" ] && [ -s "$TMPDIR/masscan_udp.txt" ]; then
   awk -F'/' '{print $1 "/udp"}' "$TMPDIR/masscan_udp.txt" >> "$AGG_RAW"
 fi
-# nmap tcp
 if [ -f "$TMPDIR/nmap_tcp.txt" ] && [ -s "$TMPDIR/nmap_tcp.txt" ]; then
   awk -F'/' '{print $1 "/tcp"}' "$TMPDIR/nmap_tcp.txt" >> "$AGG_RAW"
 fi
-# nmap udp
 if [ -f "$TMPDIR/nmap_udp.txt" ] && [ -s "$TMPDIR/nmap_udp.txt" ]; then
   awk -F'/' '{print $1 "/udp"}' "$TMPDIR/nmap_udp.txt" >> "$AGG_RAW"
 fi
-# from final raw nmap if any leftover
 if [ -f "$NMAP_RAW" ] && [ -s "$NMAP_RAW" ]; then
   grep -E '^[0-9]+/(tcp|udp)' "$NMAP_RAW" 2>/dev/null | awk '{print $1}' >> "$AGG_RAW" || true
 fi
-# masscan raw leftover
 if [ -f "$MASSCAN_RAW" ] && [ -s "$MASSCAN_RAW" ]; then
   awk '/[Dd]iscovered open port/ {
     for (i=1;i<=NF;i++) {
@@ -336,32 +310,27 @@ if [ -f "$MASSCAN_RAW" ] && [ -s "$MASSCAN_RAW" ]; then
   }' "$MASSCAN_RAW" 2>/dev/null | tr -d '\r' >> "$AGG_RAW" || true
 fi
 
-# finalize: sort version-aware and unique, ensure format is port/proto
+# finalize ports list
 if [ -s "$AGG_RAW" ]; then
   awk '{$1=$1; print}' "$AGG_RAW" | grep -E '^[0-9]+/(tcp|udp)$' | sort -V -u > "$TMPDIR/final_ports.txt" || true
 else
   : > "$TMPDIR/final_ports.txt"
 fi
 
-# If --service-scan was requested, run nmap -sV against discovered ports (but only on the ports user specified -p)
+# If service-scan, run nmap -sV against discovered ports or against the full requested range (default all ports)
 if $SERVICE_SCAN_FLAG; then
-  # Build comma-separated lists for tcp and udp from final_ports.txt but constrained to the ports user asked (-p)
-  # We will accept the discovered ports (so user can have asked 1-100 but only some discovered)
   tcp_list=$(grep '/tcp$' "$TMPDIR/final_ports.txt" | awk -F'/' '{print $1}' | paste -sd, - || true)
   udp_list=$(grep '/udp$' "$TMPDIR/final_ports.txt" | awk -F'/' '{print $1}' | paste -sd, - || true)
 
-  # If no ports discovered, still try to probe the user-supplied ports (they may be filtered but we try)
+  # If nothing discovered, probe the user-specified ports or default full range (MASSCAN_PORTS)
   if [ -z "$tcp_list" ]; then
-    # try to use user-specified ports for probe (only tcp portion)
-    # extract tcp members from PORTS_SPEC if possible (we'll just pass the whole PORTS_SPEC to nmap tcp probe)
-    # But first convert U: or other masscan syntax - assume user used normal syntax: we'll use PORTS_SPEC for tcp probe
-    tcp_list="$PORTS_SPEC"
+    tcp_list="${PORTS_SPEC:-$MASSCAN_PORTS}"
   fi
   if [ -z "$udp_list" ]; then
-    udp_list="$PORTS_SPEC"
+    udp_list="${PORTS_SPEC:-$MASSCAN_PORTS}"
   fi
 
-  # normalize placeholders
+  # normalize placeholder
   if [ -z "$tcp_list" ]; then tcp_list="-" ; fi
   if [ -z "$udp_list" ]; then udp_list="-" ; fi
 
@@ -384,7 +353,7 @@ if [ "$SCILENT" = false ]; then
   fi
 fi
 
-# If service-scan ran, print service results
+# print service results if any
 if $SERVICE_SCAN_FLAG; then
   if [ -s "$SERVICES_RAW" ]; then
     echo
