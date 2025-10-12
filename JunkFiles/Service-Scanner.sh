@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # service-scanner.sh - masscan/nmap wrapper with per-port nmap -sV enumeration
-# Behavior:
-#  --port-scan      : discovery only (masscan/nmap), print open ports
-#  --service-scan   : discovery + per-port nmap -sV, print services, then auto webanalyze
-#                     webanalyze runs ONLY if 80/tcp or 443/tcp are open, using ./technologies.json
-# Notes:
-#  - No --vuln/searchsploit integration in this version (intentionally left for later)
+
 set -euo pipefail
 
 TARGET=""
@@ -22,9 +17,6 @@ PORT_SCAN_FLAG=false
 SERVICE_SCAN_FLAG=false
 MASSCAN_FIRST=true
 
-WEBANALYZE_APP_JSON="./technologies.json"   # required file in current directory
-RUN_WEBANALYZE_ALWAYS=true                  # true: always try in --service-scan if 80/443 open
-
 print_help() {
   cat <<'EOF'
 service-scanner.sh - Port discovery + per-port service enumeration with nmap
@@ -37,7 +29,7 @@ Options:
   -p, --ports <spec>      "80", "80,443", "1-1024", "80,443,8000-8100"
   --rate <n>              masscan --rate (default: 10000)
   --port-scan             Discovery only (if no -T/-U/-TU set, defaults to both)
-  --service-scan          Discovery + per-port nmap -sV; also auto webanalyze if 80/443 open
+  --service-scan          After discovery, run per-port nmap: TCP: -sV ; UDP: -sU -sV
   --keep-tmp              Keep temporary files
   --debug                 Verbose; implies --keep-tmp
   -o, --output <file>     Save final ports list (port/proto per line)
@@ -50,6 +42,7 @@ log()     { printf "%s\n" "$*" >&2; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 expand_ports() {
+  # expand "80,443,8000-8002" -> lines of numbers
   echo "$1" | tr ',' '\n' | while read -r tok; do
     tok=$(echo "$tok" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -z "$tok" ] && continue
@@ -112,6 +105,7 @@ run_masscan() {
 }
 
 run_nmap_simple() {
+  # discovery (no -sV)
   local target="$1" proto="$2" ports="$3" outfile="$4"
   log "[*] nmap discovery ${target} proto=${proto} ports=${ports}"
   if [ "$proto" = "udp" ]; then
@@ -134,6 +128,7 @@ run_nmap_sv_one_tcp() {
   log "[*] nmap -sV TCP ${target} -p ${port}"
   nmap -Pn -sV -p "$port" -oN "$outfile" "$target" >/dev/null 2>&1 || true
 }
+
 run_nmap_sv_one_udp() {
   local target="$1" port="$2" outfile="$3"
   log "[*] nmap -sU -sV UDP ${target} -p ${port}"
@@ -142,69 +137,6 @@ run_nmap_sv_one_udp() {
   else
     nmap -Pn -sU -sV -p "$port" -oN "$outfile" "$target" >/dev/null 2>&1 || true
   fi
-}
-
-# ---- webanalyze: only 80/443 and only full versions ----
-flatten_webanalyze_full_versions() {
-  # input: raw webanalyze lines like "Liferay,7.3.1 (CMS)"
-  # output: only "Name 7.3.1" (no major/minor variants)
-  local infile="$1" outfile="$2"
-  sed '/^[[:space:]]*$/d' "$infile" \
-    | while IFS= read -r raw; do
-        line=$(echo "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
-        [ -z "$line" ] && continue
-        norm=$(echo "$line" | tr '_' '.')
-        ver=$(echo "$norm" | grep -oE 'v?[0-9]+(\.[0-9]+){1,}' | head -n1 || true)
-        if [ -n "$ver" ]; then
-          ver=$(echo "$ver" | sed -E 's/^[vV]//')
-          ver=$(echo "$ver" | grep -oE '^[0-9]+(\.[0-9]+)*' || true)
-        else
-          # fallback to single integer (rare)
-          ver=$(echo "$norm" | grep -oE 'v?[0-9]+' | head -n1 || true)
-          ver=$(echo "$ver" | sed -E 's/^[vV]//')
-        fi
-        [ -z "$ver" ] && continue
-
-        if echo "$line" | grep -q ','; then
-          name=$(echo "$line" | sed -E 's/,.*$//' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
-        else
-          name=$(echo "$line" | sed -E 's/[[:space:]]+v?[0-9]+(\.[0-9]+){0,}.*$//I' | sed -E 's/\([^)]+\)//g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
-        fi
-        [ -z "$name" ] && name="$line"
-
-        echo "$name $ver"
-      done | sort -u > "$outfile" || true
-}
-
-run_webanalyze_one() {
-  local scheme="$1" host="$2" port="$3" outdir="$4"
-  local wa_out="$outdir/webanalyze_${port}.txt"
-  if ! has_cmd webanalyze; then
-    log "[!] webanalyze not installed; skipping."
-    return 1
-  fi
-  if [ ! -f "$WEBANALYZE_APP_JSON" ]; then
-    log "[!] technologies.json not found at $WEBANALYZE_APP_JSON; skipping."
-    return 1
-  fi
-  log "[*] webanalyze ${scheme}://${host}:${port}"
-  #webanalyze -apps "$WEBANALYZE_APP_JSON" -host "${host}:${port}" 2>/dev/null | tee "$wa_out" >/dev/null || true
-
-  # decide URL style
-  if [ "$port" = "443" ]; then
-    target_url="https://${host}"
-  elif [ "$port" = "80" ]; then
-    target_url="http://${host}"
-  else
-    target_url="${host}:${port}"
-  fi
-
-  #webanalyze -apps "$WEBANALYZE_APP_JSON" -host "$target_url" 2>/dev/null | tee "$wa_out" >/dev/null || true
-  webanalyze -apps "$WEBANALYZE_APP_JSON" -host "$target_url"
-
-  local flat="$outdir/webanalyze_${port}.flat"
-  flatten_webanalyze_full_versions "$wa_out" "$flat"
-  [ -s "$flat" ] && return 0 || return 2
 }
 
 # ---- arg parsing ----
@@ -250,9 +182,7 @@ PARSED_TCP="$TMPDIR/open_tcp.txt"
 PARSED_UDP="$TMPDIR/open_udp.txt"
 FINAL_PORTS="$TMPDIR/final_ports.txt"
 SERVICES_RAW="$TMPDIR/services.txt"
-WEBANALYZE_OUTDIR="$TMPDIR/webanalyze"
 : > "$SERVICES_RAW"
-mkdir -p "$WEBANALYZE_OUTDIR"
 
 PORTS_TCP="${PORTS_SPEC:-1-65535}"
 PORTS_UDP="${PORTS_SPEC:-1-65535}"
@@ -267,6 +197,7 @@ if $DO_TCP; then
     parse_nmap_ports "$RAW_NMAP_TCP" "$PARSED_TCP"
   fi
 fi
+
 if $DO_UDP; then
   if $MASSCAN_FIRST && has_cmd masscan; then
     run_masscan "$TARGET" "udp" "$PORTS_UDP" "$RAW_MASS_UDP"
@@ -317,6 +248,7 @@ if $SERVICE_SCAN_FLAG; then
       [ -s "${out}.parsed" ] && cat "${out}.parsed" >> "$SERVICES_RAW"
     done < "$TMPDIR/tcp_elist.txt"
   fi
+
   if [ -s "$TMPDIR/udp_elist.txt" ]; then
     while read -r p; do
       [ -z "$p" ] && continue
@@ -335,42 +267,6 @@ if $SERVICE_SCAN_FLAG; then
   else
     echo
     log "[!] No services discovered (nmap -sV returned nothing or nmap not installed)."
-  fi
-
-  # ---- auto webanalyze only for 80/tcp and 443/tcp ----
-  if $RUN_WEBANALYZE_ALWAYS; then
-    have80=false; have443=false
-    grep -q '^80/tcp$'  "$FINAL_PORTS" 2>/dev/null && have80=true
-    grep -q '^443/tcp$' "$FINAL_PORTS" 2>/dev/null && have443=true
-
-    if $have80 || $have443; then
-      echo
-      log "[*] Running webanalyze using $WEBANALYZE_APP_JSON on open web ports..."
-      : > "$TMPDIR/web_techs_full.txt"
-
-      if $have80;  then run_webanalyze_one "http"  "$TARGET" 80  "$WEBANALYZE_OUTDIR" || true; fi
-      if $have443; then run_webanalyze_one "https" "$TARGET" 443 "$WEBANALYZE_OUTDIR" || true; fi
-
-      # collect flats
-      for flat in "$WEBANALYZE_OUTDIR"/webanalyze_*.flat; do
-        [ -s "$flat" ] || continue
-        port="${flat##*_}"; port="${port%.flat}"
-        scheme="http"; [ "$port" = "443" ] && scheme="https"
-        echo "---- ${scheme}://${TARGET}:${port} ----" >> "$TMPDIR/web_techs_full.txt"
-        cat "$flat" >> "$TMPDIR/web_techs_full.txt"
-        echo >> "$TMPDIR/web_techs_full.txt"
-      done
-
-      if [ -s "$TMPDIR/web_techs_full.txt" ]; then
-        echo
-        echo "==== Web technologies (full versions only) ===="
-        cat "$TMPDIR/web_techs_full.txt"
-      else
-        log "[!] webanalyze produced no parsed results."
-      fi
-    else
-      log "[*] Skipping webanalyze: neither 80/tcp nor 443/tcp were found open."
-    fi
   fi
 fi
 
