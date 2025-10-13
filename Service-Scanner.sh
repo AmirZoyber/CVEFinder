@@ -2,7 +2,7 @@
 # service-scanner.sh - masscan/nmap wrapper with per-port nmap -sV enumeration
 # - Timestamped, categorized logs with symbols and optional colors
 # - Per-finding logs: "80/tcp found by masscan" / "443/tcp found by nmap"
-# - End-of-run deduped, sorted summaries of ports and services with sources
+# - End-of-run deduped, sorted summaries of ports and services (no source names)
 # - Tool raw outputs go to tmp files; screen shows only our logs/summaries
 set -euo pipefail
 
@@ -49,11 +49,11 @@ fi
 
 # Colors
 if [ "$_supports_color" = true ]; then
-  C_RST="$(tput sgr0)"; C_DIM="$(tput dim)"; C_BLD="$(tput bold)"
+  C_RST="$(tput sgr0)"; C_BLD="$(tput bold)"
   C_OK="$(tput setaf 2)"; C_INF="$(tput setaf 6)"; C_WRN="$(tput setaf 3)"
   C_ERR="$(tput setaf 1)"; C_DBG="$(tput setaf 8)"
 else
-  C_RST=""; C_DIM=""; C_BLD=""; C_OK=""; C_INF=""; C_WRN=""; C_ERR=""; C_DBG=""
+  C_RST=""; C_BLD=""; C_OK=""; C_INF=""; C_WRN=""; C_ERR=""; C_DBG=""
 fi
 
 _log_core() {
@@ -191,18 +191,16 @@ PARSED_UDP="$TMPDIR/open_udp.txt"
 FINAL_PORTS="$TMPDIR/final_ports.txt"
 
 SERVICES_RAW="$TMPDIR/services.txt"
-SERVICES_WITH_SRC="$TMPDIR/services_with_src.txt"
+: > "$SERVICES_RAW"
 
 WEBANALYZE_OUTDIR="$TMPDIR/webanalyze"
 mkdir -p "$WEBANALYZE_OUTDIR"
 
-# Tracking “who found what”
-PORT_FINDINGS="$TMPDIR/port_findings.tsv"     # columns: port/proto <TAB> tool
-SERVICE_FINDINGS="$TMPDIR/service_findings.tsv" # columns: key <TAB> tool
+# Tracking (internal; not shown in final summaries)
+PORT_FINDINGS="$TMPDIR/port_findings.tsv"       # columns: port/proto <TAB> tool
+SERVICE_FINDINGS="$TMPDIR/service_findings.tsv" # columns: "port/proto -> svc banner" <TAB> tool
 : > "$PORT_FINDINGS"
 : > "$SERVICE_FINDINGS"
-: > "$SERVICES_RAW"
-: > "$SERVICES_WITH_SRC"
 
 # -----------------------
 # Utilities
@@ -286,29 +284,29 @@ parse_nmap_services() {
   fi
 }
 
-# Flatten webanalyze lines to "Name version" pairs (full versions only)
+# Flatten webanalyze output to "Name version" (only real versions like 1.2, 2.4.7)
 flatten_webanalyze_full_versions() {
   local infile="$1" outfile="$2"
+  : > "$outfile"
   sed '/^[[:space:]]*$/d' "$infile" \
+    | grep -viE '^(https?://|url:|host:)' \
     | while IFS= read -r raw; do
-        line=$(echo "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+        line=$(printf "%s" "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
         [ -z "$line" ] && continue
-        norm=$(echo "$line" | tr '_' '.')
-        ver=$(echo "$norm" | grep -oE 'v?[0-9]+(\.[0-9]+){1,}' | head -n1 || true)
-        if [ -n "$ver" ]; then
-          ver=$(echo "$ver" | sed -E 's/^[vV]//')
-          ver=$(echo "$ver" | grep -oE '^[0-9]+(\.[0-9]+)*' || true)
-        else
-          ver=$(echo "$norm" | grep -oE 'v?[0-9]+' | head -n1 || true)
-          ver=$(echo "$ver" | sed -E 's/^[vV]//')
-        fi
+
+        # must contain at least x.y to count as version; drop IP-ish or host title junk
+        ver=$(printf "%s" "$line" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)
         [ -z "$ver" ] && continue
-        if echo "$line" | grep -q ','; then
-          name=$(echo "$line" | sed -E 's/,.*$//' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
-        else
-          name=$(echo "$line" | sed -E 's/[[:space:]]+v?[0-9]+(\.[0-9]+){0,}.*$//I' | sed -E 's/\([^)]+\)//g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
-        fi
-        [ -z "$name" ] && name="$line"
+        printf "%s" "$line" | grep -qE 'https?://|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' && continue
+
+        # name = line up to version (trim parentheses), normalize underscores to dots
+        name=$(printf "%s" "$line" \
+                | tr '_' '.' \
+                | sed -E "s/[[:space:]]+$ver.*$//" \
+                | sed -E 's/\([^)]+\)//g' \
+                | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+        [ -z "$name" ] && continue
+
         echo "$name $ver"
       done | sort -u > "$outfile" || true
 }
@@ -362,7 +360,7 @@ run_nmap_sv_one_udp() {
   fi
 }
 
-# webanalyze runner for one port (80/443 only)
+# webanalyze runner for one port (80/443 only), writes normalized service lines
 run_webanalyze_one() {
   local scheme="$1" host="$2" port="$3" outdir="$4"
   local wa_out="$outdir/webanalyze_${port}.txt"
@@ -395,10 +393,11 @@ run_webanalyze_one() {
   local flat="$outdir/webanalyze_${port}.flat"
   flatten_webanalyze_full_versions "$wa_out" "$flat"
   if [ -s "$flat" ]; then
+    local pp="${port}/tcp"
     while IFS= read -r tech; do
       [ -z "$tech" ] && continue
-      printf "web:%s -> %s\twebanalyze\n" "$port" "$tech" >> "$SERVICE_FINDINGS"
-      log_ok "Web tech (port $port): $tech (webanalyze)"
+      printf "%s -> %s\twebanalyze\n" "$pp" "$tech" >> "$SERVICE_FINDINGS"
+      log_ok "Web tech ($pp): $tech (webanalyze)"
     done < "$flat"
     return 0
   fi
@@ -425,7 +424,7 @@ if [ "$DO_UDP" = "true" ]; then
   if [ "$MASSCAN_FIRST" = "true" ] && check_installed masscan; then
     run_masscan "$TARGET" "udp" "$PORTS_UDP" "$RAW_MASS_UDP"
     parse_masscan_to_ports "$RAW_MASS_UDP" "$MASS_UDP_PORTS" "masscan"
-    # also try nmap UDP discovery to augment
+    # augment with nmap UDP discovery
     run_nmap_simple "$TARGET" "udp" "$PORTS_UDP" "$RAW_NMAP_UDP"
     parse_nmap_ports "$RAW_NMAP_UDP" "$NMAP_UDP_PORTS" "nmap"
   else
@@ -472,12 +471,6 @@ fi
 if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
   if [ ! -s "$FINAL_PORTS" ]; then
     log_info "--service-scan requested but no open ports were discovered. Exiting."
-    # Still show a compact “who tried what” (ports) if any:
-    if [ -s "$PORT_FINDINGS" ]; then
-      echo
-      echo "==== Port findings (no open ports after dedupe) ===="
-      awk '{print $1" ["$2"]"}' "$PORT_FINDINGS" | sort -u
-    fi
     exit 0
   fi
 fi
@@ -531,48 +524,24 @@ if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
   fi
 
   # -----------------------
-  # Summaries
+  # Summaries (clean — no tool/source tags)
   # -----------------------
   echo
-  echo "==== Port summary (deduped + sorted with sources) ===="
+  echo "==== Port summary (deduped + sorted) ===="
   if [ -s "$FINAL_PORTS" ]; then
-    # For each final port, list unique tools that reported it
-    while read -r pp; do
-      tools=$(awk -v k="$pp" -F'\t' '$1==k {print $2}' "$PORT_FINDINGS" 2>/dev/null | sort -u | paste -sd',' -)
-      [ -n "$tools" ] || tools="(source unknown)"
-      printf "%-10s [%s]\n" "$pp" "$tools"
-    done < "$FINAL_PORTS"
+    cat "$FINAL_PORTS"
   else
     echo "(none)"
   fi
 
-  # Build deduped services with sources
-  if [ -s "$SERVICES_RAW" ] || [ -s "$SERVICE_FINDINGS" ]; then
-    # Normalize SERVICE_FINDINGS into SERVICES_WITH_SRC for final echo
-    # We want lines like: "port/proto -> service [tools]"
-    # SERVICE_FINDINGS keys may be "port -> svc banner" or "web:<port> -> Tech ver"
-    # We'll print exactly the left side + [tools]
-    awk -F'\t' '{print $1"\t"$2}' "$SERVICE_FINDINGS" 2>/dev/null \
-      | sort -u > "$TMPDIR/_svc_pairs.tsv" || true
-
-    # Aggregate tools per key
-    : > "$SERVICES_WITH_SRC"
-    while IFS=$'\t' read -r key tool; do
-      echo "$key	$tool"
-    done < "$TMPDIR/_svc_pairs.tsv" \
-      | awk -F'\t' '
-         { a[$1]=(a[$1]?a[$1]","$2:$2) }
-         END { for (k in a) print k "\t[" a[k] "]" }' \
-      | sort -V > "$SERVICES_WITH_SRC"
-  fi
-
   echo
   echo "==== Services discovered (deduped) ===="
-  if [ -s "$SERVICES_WITH_SRC" ]; then
-    # Pretty print: keep original "port -> svc banner" then [tools]
-    while IFS=$'\t' read -r left right; do
-      printf "%s %s\n" "$left" "$right"
-    done < "$SERVICES_WITH_SRC"
+  if [ -s "$SERVICE_FINDINGS" ]; then
+    # print just the unique left side: "port/proto -> service [banner]"
+    awk -F'\t' '{print $1}' "$SERVICE_FINDINGS" | sort -V -u
+  elif [ -s "$SERVICES_RAW" ]; then
+    # fallback if anything landed only in SERVICES_RAW
+    sort -V -u "$SERVICES_RAW"
   else
     echo "(none)"
   fi
