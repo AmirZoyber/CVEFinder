@@ -317,7 +317,9 @@ run_webanalyze_one() {
   elif [ "$port" = "80" ]; then
     target_url="http://${host}"
   else
-    target_url="${scheme}://${host}:${port}"
+    #target_url="${scheme}://${host}:${port}"
+    log "[!] Webanalyze - Only 80 and 443 are supported by this function; skipping."
+    return 1
   fi
 
   if [ "$EUID" -ne 0 ]; then
