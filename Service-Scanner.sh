@@ -42,7 +42,7 @@ die()     { log "[ERROR] $*"; exit 1; }
 # check if app is installed
 check_installed() {
     local app="$1"
-    if which "$app" >/dev/null 2>&1; then
+    if which "$app" >/dev/null; then
         return 0    # true
     else
         return 1    # false
