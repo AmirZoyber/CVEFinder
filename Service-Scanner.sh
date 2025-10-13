@@ -381,7 +381,7 @@ if [ "$SCILENT" != "true" ]; then
 fi
 
 # -----------------------
-# NEW BEHAVIOR: if --service-scan requested but no open ports -> exit early
+# if --service-scan requested but no open ports -> exit early
 # -----------------------
 if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
   if [ ! -s "$FINAL_PORTS" ]; then
