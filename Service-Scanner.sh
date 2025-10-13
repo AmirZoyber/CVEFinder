@@ -47,9 +47,9 @@ Usage: ./service-scanner.sh -t <target> [options]
 
 Options (CLI overrides config.conf):
   -t, --target <target>    Target IP/CIDR/hostname (overrides TARGET in config)
-  -T                       Force scanning TCP (sets DO_TCP=true)
-  -U                       Force scanning UDP (sets DO_UDP=true)
-  -TU                      Force both TCP and UDP
+  -T                       Scan TCP
+  -U                       Scan UDP
+  -TU                      Scan both TCP and UDP
   -p, --ports <spec>       Port spec (overrides PORTS_SPEC), e.g. "80,443,8000-8100"
   --rate <n>               masscan --rate (overrides RATE from config)
   --port-scan              Discovery only (sets PORT_SCAN_FLAG=true)
@@ -366,6 +366,16 @@ if [ "$SCILENT" != "true" ]; then
     cat "$FINAL_PORTS"
   else
     log "[!] No open ports discovered."
+  fi
+fi
+
+# -----------------------
+# NEW BEHAVIOR: if --service-scan requested but no open ports -> exit early
+# -----------------------
+if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
+  if [ ! -s "$FINAL_PORTS" ]; then
+    log "[*] --service-scan requested but no open ports were discovered. Exiting (no service enumeration will be run)."
+    exit 0
   fi
 fi
 
