@@ -8,6 +8,7 @@
 #  - No --vuln/searchsploit integration in this version (intentionally left for later)
 set -euo pipefail
 
+
 # ---- config file config.conf----
 CONFIGFILE="./config.conf"
 if [ -f "$CONFIGFILE" ]; then
@@ -39,9 +40,13 @@ print_help() {
 EOF
 }
 
+# log
 log()     { printf "%s\n" "$*" >&2; }
+
+# check if command exists
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# expand port specifications like "80,443,8000-8100" into a sorted list of ports
 expand_ports() {
   echo "$1" | tr ',' '\n' | while read -r tok; do
     tok=$(echo "$tok" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -59,6 +64,7 @@ expand_ports() {
   done | awk 'NF' | sort -n | uniq
 }
 
+# parse masscan output to port/proto format
 parse_masscan_to_ports() {
   local infile="$1" out="$2"
   awk '/[Dd]iscovered open port/ {
@@ -69,6 +75,7 @@ parse_masscan_to_ports() {
     | sort -V -u > "$out" || true
 }
 
+# parse nmap output to port/proto format
 parse_nmap_ports() {
   local infile="$1" out="$2"
   grep -E '^[[:space:]]*[0-9]+/(tcp|udp)' "$infile" 2>/dev/null \
@@ -78,6 +85,7 @@ parse_nmap_ports() {
     | sort -V -u > "$out" || true
 }
 
+# parse nmap -sV output to "port/proto -> service banner" format
 parse_nmap_services() {
   local infile="$1" out="$2"
   awk '/^[[:space:]]*[0-9]+\/(tcp|udp)/ {
@@ -92,6 +100,7 @@ parse_nmap_services() {
     | sort -V -u > "$out" || true
 }
 
+# ---- run masscan ----
 run_masscan() {
   local target="$1" proto="$2" ports="$3" outfile="$4"
   local parg
@@ -104,6 +113,7 @@ run_masscan() {
   fi
 }
 
+# ---- run nmap ----
 run_nmap_simple() {
   local target="$1" proto="$2" ports="$3" outfile="$4"
   log "[*] nmap discovery ${target} proto=${proto} ports=${ports}"
@@ -122,11 +132,14 @@ run_nmap_simple() {
   fi
 }
 
+# ---- run nmap -sV one-port ----
 run_nmap_sv_one_tcp() {
   local target="$1" port="$2" outfile="$3"
   log "[*] nmap -sV TCP ${target} -p ${port}"
   nmap -Pn -sV -p "$port" -oN "$outfile" "$target" >/dev/null 2>&1 || true
 }
+
+# ---- run nmap -sV one-port UDP ----
 run_nmap_sv_one_udp() {
   local target="$1" port="$2" outfile="$3"
   log "[*] nmap -sU -sV UDP ${target} -p ${port}"
@@ -169,6 +182,7 @@ flatten_webanalyze_full_versions() {
       done | sort -u > "$outfile" || true
 }
 
+#---- run webanalyze one port ----
 run_webanalyze_one() {
   local scheme="$1" host="$2" port="$3" outdir="$4"
   local wa_out="$outdir/webanalyze_${port}.txt"
@@ -221,8 +235,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ---- validate args ----
 [ -z "$TARGET" ] && { log "error: -t/--target is required"; exit 2; }
 
+# arg defaults
 if ! $DO_TCP && ! $DO_UDP; then
   if $PORT_SCAN_FLAG; then DO_TCP=true; DO_UDP=true; else DO_TCP=true; fi
 fi
@@ -230,6 +246,7 @@ if $SERVICE_SCAN_FLAG && $PORT_SCAN_FLAG; then
   log "error: Use --service-scan alone (do not combine with --port-scan)."; exit 2
 fi
 
+# tmp dir and cleanup handler
 TMPDIR="$(mktemp -d /tmp/svcscan.XXXXXX)"
 [ "$DEBUG" = true ] && log "[debug] TMPDIR=$TMPDIR"
 cleanup() { if ! $KEEP_TMP; then rm -rf "$TMPDIR"; else log "[*] Keeping tmp: $TMPDIR"; fi; }
@@ -247,10 +264,10 @@ WEBANALYZE_OUTDIR="$TMPDIR/webanalyze"
 : > "$SERVICES_RAW"
 mkdir -p "$WEBANALYZE_OUTDIR"
 
-PORTS_TCP="${PORTS_SPEC:-1-65535}"
-PORTS_UDP="${PORTS_SPEC:-1-65535}"
 
-# ---- discovery ----
+
+
+# port specs and rate --- discovery
 if $DO_TCP; then
   if $MASSCAN_FIRST && has_cmd masscan; then
     run_masscan "$TARGET" "tcp" "$PORTS_TCP" "$RAW_MASS_TCP"
@@ -274,6 +291,7 @@ if $DO_UDP; then
   fi
 fi
 
+# ---- combine and print final ports ----
 : > "$FINAL_PORTS"
 [ -s "$PARSED_TCP" ] && cat "$PARSED_TCP" >> "$FINAL_PORTS"
 [ -s "$PARSED_UDP" ] && cat "$PARSED_UDP" >> "$FINAL_PORTS"
@@ -281,6 +299,7 @@ fi
 
 if [ -n "$OUTFILE" ]; then cp "$FINAL_PORTS" "$OUTFILE" 2>/dev/null || true; log "[*] final ports written to: $OUTFILE"; fi
 
+# if not scilent, print final ports
 if [ "$SCILENT" = false ]; then
   if [ -s "$FINAL_PORTS" ]; then
     echo "==== Open ports (port/proto) ===="
