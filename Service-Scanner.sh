@@ -8,24 +8,17 @@
 #  - No --vuln/searchsploit integration in this version (intentionally left for later)
 set -euo pipefail
 
-TARGET=""
-DO_TCP=false
-DO_UDP=false
-OUTFILE=""
-SCILENT=false
-KEEP_TMP=false
-DEBUG=false
+# ---- config file config.conf----
+CONFIGFILE="./config.conf"
+if [ -f "$CONFIGFILE" ]; then
+  # shellcheck source=./config.conf
+  . "$CONFIGFILE"
+else
+  echo "[!] config.conf not found; using built-in defaults."
+  # exit the code if config.conf is missing
+  exit 1
 
-RATE="10000"
-PORTS_SPEC=""
-PORT_SCAN_FLAG=false
-SERVICE_SCAN_FLAG=false
-MASSCAN_FIRST=true
-
-WEBANALYZE_APP_JSON="./technologies.json"   # required file in current directory
-RUN_WEBANALYZE_ALWAYS=true                  # true: always try in --service-scan if 80/443 open
-
-# print help message with switche -h or --help
+# print help message with switches -h or --help
 print_help() {
   cat <<'EOF'
   service-scanner.sh - Port discovery + per-port service enumeration with nmap
