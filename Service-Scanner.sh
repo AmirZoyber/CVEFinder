@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # service-scanner.sh - masscan/nmap wrapper with per-port nmap -sV enumeration
-# The script sources ./config.conf for all static variables.
+# - Timestamped, categorized logs with symbols and optional colors
+# - Per-finding logs: "80/tcp found by masscan" / "443/tcp found by nmap"
+# - End-of-run deduped, sorted summaries of ports and services with sources
+# - Tool raw outputs go to tmp files; screen shows only our logs/summaries
 set -euo pipefail
 
 # -----------------------
@@ -33,22 +36,41 @@ fi
 unset _required_vars _missing m v
 
 # -----------------------
-# Helpers
+# Logging (timestamps + categories + symbols + optional colors)
 # -----------------------
-log()     { printf "%s\n" "$*" >&2; }
-die()     { log "[ERROR] $*"; exit 1; }
-#check_installed() { command -v "$1" >/dev/null 2>&1; }
+_ts() { date +"%Y-%m-%d %H:%M:%S"; }
 
-# check if app is installed
-check_installed() {
-    local app="$1"
-    if which "$app" >/dev/null; then
-        return 0    # true
-    else
-        return 1    # false
-    fi
+_supports_color=false
+if [ -t 2 ] && command -v tput >/dev/null 2>&1; then
+  if [ "${NO_COLOR:-}" = "" ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    _supports_color=true
+  fi
+fi
+
+# Colors
+if [ "$_supports_color" = true ]; then
+  C_RST="$(tput sgr0)"; C_DIM="$(tput dim)"; C_BLD="$(tput bold)"
+  C_OK="$(tput setaf 2)"; C_INF="$(tput setaf 6)"; C_WRN="$(tput setaf 3)"
+  C_ERR="$(tput setaf 1)"; C_DBG="$(tput setaf 8)"
+else
+  C_RST=""; C_DIM=""; C_BLD=""; C_OK=""; C_INF=""; C_WRN=""; C_ERR=""; C_DBG=""
+fi
+
+_log_core() {
+  # $1 level, $2 symbol, $3 color, $4 message
+  printf "%s %s%s%s %s\n" "$(_ts)" "$3" "$2" "$C_RST" "$4" >&2
 }
 
+log_ok()   { _log_core OK  "[+]" "$C_OK"  "$*"; }
+log_info() { _log_core INF "[*]" "$C_INF" "$*"; }
+log_warn() { _log_core WRN "[!]" "$C_WRN" "$*"; }
+log_err()  { _log_core ERR "[x]" "$C_ERR" "$*"; }
+log_dbg()  { [ "${DEBUG:-false}" = "true" ] && _log_core DBG "[·]" "$C_DBG" "$*"; }
+
+die() { log_err "$*"; exit 1; }
+
+# check if app is installed (exit code semantics)
+check_installed() { which "$1" >/dev/null 2>&1; }
 
 print_help() {
   cat <<'EOF'
@@ -76,7 +98,6 @@ EOF
 # -----------------------
 # Arg parsing (CLI overrides config)
 # -----------------------
-# copy config values into mutable vars
 TARGET="${TARGET:-}"
 DO_TCP="${DO_TCP:-false}"
 DO_UDP="${DO_UDP:-false}"
@@ -94,7 +115,6 @@ RUN_WEBANALYZE_ALWAYS="${RUN_WEBANALYZE_ALWAYS:-false}"
 PORTS_TCP="${PORTS_TCP:-1-65535}"
 PORTS_UDP="${PORTS_UDP:-1-65535}"
 
-# parse args
 if [ $# -eq 0 ]; then print_help; exit 1; fi
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -111,24 +131,22 @@ while [ $# -gt 0 ]; do
     -o|--output) OUTFILE="$2"; shift 2;;
     -s|--scilence) SCILENT=true; shift;;
     -h|--help) print_help; exit 0;;
-    *) log "Unknown option: $1"; print_help; exit 2;;
+    *) log_err "Unknown option: $1"; print_help; exit 2;;
   esac
 done
 
 # -----------------------
-# Validate target
+# Validate target, defaults
 # -----------------------
 if [ -z "$TARGET" ]; then
   die "Target is required (-t/--target or set TARGET in $CONFIGFILE)."
 fi
 
-# apply PORTS_SPEC to per-protocol defaults if set
 if [ -n "$PORTS_SPEC" ]; then
   PORTS_TCP="$PORTS_SPEC"
   PORTS_UDP="$PORTS_SPEC"
 fi
 
-# default behavior: if neither DO_TCP nor DO_UDP set, choose sensible default
 if [ "$DO_TCP" != "true" ] && [ "$DO_UDP" != "true" ]; then
   if [ "$PORT_SCAN_FLAG" = "true" ]; then
     DO_TCP=true; DO_UDP=true
@@ -137,38 +155,57 @@ if [ "$DO_TCP" != "true" ] && [ "$DO_UDP" != "true" ]; then
   fi
 fi
 
-# disallow combining port-scan and service-scan
 if [ "$SERVICE_SCAN_FLAG" = "true" ] && [ "$PORT_SCAN_FLAG" = "true" ]; then
   die "Use --service-scan alone (do not combine with --port-scan)."
 fi
 
+# -----------------------
 # tmpdir and cleanup
+# -----------------------
 TMPDIR="$(mktemp -d /tmp/svcscan.XXXXXX)"
-if [ "$DEBUG" = "true" ]; then log "[debug] TMPDIR=$TMPDIR"; fi
+log_dbg "TMPDIR=$TMPDIR"
 cleanup() {
   if [ "$KEEP_TMP" = "true" ]; then
-    log "[*] Keeping tmp: $TMPDIR"
+    log_info "Keeping tmp: $TMPDIR"
   else
     rm -rf "$TMPDIR"
   fi
 }
 trap cleanup EXIT
 
-# file paths
+# -----------------------
+# File paths
+# -----------------------
 RAW_MASS_TCP="$TMPDIR/masscan_tcp.raw"
 RAW_MASS_UDP="$TMPDIR/masscan_udp.raw"
 RAW_NMAP_TCP="$TMPDIR/nmap_tcp.raw"
 RAW_NMAP_UDP="$TMPDIR/nmap_udp.raw"
+
+MASS_TCP_PORTS="$TMPDIR/masscan_tcp.ports"
+MASS_UDP_PORTS="$TMPDIR/masscan_udp.ports"
+NMAP_TCP_PORTS="$TMPDIR/nmap_tcp.ports"
+NMAP_UDP_PORTS="$TMPDIR/nmap_udp.ports"
+
 PARSED_TCP="$TMPDIR/open_tcp.txt"
 PARSED_UDP="$TMPDIR/open_udp.txt"
 FINAL_PORTS="$TMPDIR/final_ports.txt"
+
 SERVICES_RAW="$TMPDIR/services.txt"
+SERVICES_WITH_SRC="$TMPDIR/services_with_src.txt"
+
 WEBANALYZE_OUTDIR="$TMPDIR/webanalyze"
-: > "$SERVICES_RAW"
 mkdir -p "$WEBANALYZE_OUTDIR"
 
+# Tracking “who found what”
+PORT_FINDINGS="$TMPDIR/port_findings.tsv"     # columns: port/proto <TAB> tool
+SERVICE_FINDINGS="$TMPDIR/service_findings.tsv" # columns: key <TAB> tool
+: > "$PORT_FINDINGS"
+: > "$SERVICE_FINDINGS"
+: > "$SERVICES_RAW"
+: > "$SERVICES_WITH_SRC"
+
 # -----------------------
-# Utilities: port expansion and parsers
+# Utilities
 # -----------------------
 expand_ports() {
   echo "$1" | tr ',' '\n' | while read -r tok; do
@@ -188,39 +225,68 @@ expand_ports() {
 }
 
 parse_masscan_to_ports() {
-  local infile="$1" out="$2"
+  # $1 infile $2 outports $3 toolname
+  local infile="$1" out="$2" tool="${3:-masscan}"
   awk '/[Dd]iscovered open port/ {
     for (i=1;i<=NF;i++) if ($i ~ /\/(tcp|udp)$/) print $i
   }' "$infile" 2>/dev/null \
-    | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | tr -d '\r' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
     | awk -F/ '$1 ~ /^[0-9]+$/ && ($2=="tcp"||$2=="udp") {print $1"/"$2}' \
     | sort -V -u > "$out" || true
+
+  if [ -s "$out" ]; then
+    while read -r pp; do
+      [ -z "$pp" ] && continue
+      printf "%s\t%s\n" "$pp" "$tool" >> "$PORT_FINDINGS"
+      log_ok "$pp found by ${tool}"
+    done < "$out"
+  fi
 }
 
 parse_nmap_ports() {
-  local infile="$1" out="$2"
+  # $1 infile $2 outports $3 toolname
+  local infile="$1" out="$2" tool="${3:-nmap}"
   grep -E '^[[:space:]]*[0-9]+/(tcp|udp)' "$infile" 2>/dev/null \
     | awk '{gsub(/^[ \t]+/,""); print $1}' \
     | tr -d '\r' \
     | awk -F/ '$1 ~ /^[0-9]+$/ && ($2=="tcp"||$2=="udp") {print $1"/"$2}' \
     | sort -V -u > "$out" || true
+
+  if [ -s "$out" ]; then
+    while read -r pp; do
+      [ -z "$pp" ] && continue
+      printf "%s\t%s\n" "$pp" "$tool" >> "$PORT_FINDINGS"
+      log_ok "$pp found by ${tool}"
+    done < "$out"
+  fi
 }
 
 parse_nmap_services() {
-  local infile="$1" out="$2"
+  # $1 infile $2 out $3 toolname
+  local infile="$1" out="$2" tool="${3:-nmap -sV}"
   awk '/^[[:space:]]*[0-9]+\/(tcp|udp)/ {
     sub(/^[ \t]+/,"");
     portproto=$1; state=$2; svc=$3; banner="";
     if (portproto ~ /^PORT/) next;
     for (i=4;i<=NF;i++) banner=banner" "$i;
     gsub(/^ +| +$/,"",banner);
+    if (svc == "" || svc == "unknown") next;
     printf "%s -> %s%s\n", portproto, svc, (banner ? " " banner : "")
   }' "$infile" 2>/dev/null \
     | tr -d '\r' \
     | sort -V -u > "$out" || true
+
+  if [ -s "$out" ]; then
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      printf "%s\t%s\n" "$line" "$tool" >> "$SERVICE_FINDINGS"
+      log_info "Service: $line  (${tool})"
+    done < "$out"
+  fi
 }
 
-# flatten webanalyze lines to "Name version" pairs (full versions only)
+# Flatten webanalyze lines to "Name version" pairs (full versions only)
 flatten_webanalyze_full_versions() {
   local infile="$1" outfile="$2"
   sed '/^[[:space:]]*$/d' "$infile" \
@@ -248,23 +314,23 @@ flatten_webanalyze_full_versions() {
 }
 
 # -----------------------
-# Runner functions
+# Runners
 # -----------------------
 run_masscan() {
   local target="$1" proto="$2" ports="$3" outfile="$4"
   local parg
   if [ "$proto" = "udp" ]; then parg="-pU:${ports}"; else parg="-p${ports}"; fi
-  log "[*] masscan ${target} proto=${proto} ports=${ports} rate=${RATE}"
+  log_info "masscan ${target} proto=${proto} ports=${ports} rate=${RATE}"
   if [ "$EUID" -ne 0 ]; then
-    sudo masscan ${parg} --rate "${RATE}" "${target}" 2>&1 | tee "$outfile" || true
+    sudo masscan ${parg} --rate "${RATE}" "${target}" 2>&1 | tee "$outfile" >/dev/null || true
   else
-    masscan ${parg} --rate "${RATE}" "${target}" 2>&1 | tee "$outfile" || true
+    masscan ${parg} --rate "${RATE}" "${target}" 2>&1 | tee "$outfile" >/dev/null || true
   fi
 }
 
 run_nmap_simple() {
   local target="$1" proto="$2" ports="$3" outfile="$4"
-  log "[*] nmap discovery ${target} proto=${proto} ports=${ports}"
+  log_info "nmap discovery ${target} proto=${proto} ports=${ports:-auto}"
   if [ "$proto" = "udp" ]; then
     if [ -n "$ports" ]; then
       nmap -Pn -sU -p "$ports" -oN "$outfile" "$target" >/dev/null 2>&1 || true
@@ -282,13 +348,13 @@ run_nmap_simple() {
 
 run_nmap_sv_one_tcp() {
   local target="$1" port="$2" outfile="$3"
-  log "[*] nmap -sV TCP ${target} -p ${port}"
+  log_info "nmap -sV TCP ${target} -p ${port}"
   nmap -Pn -sV -p "$port" -oN "$outfile" "$target" >/dev/null 2>&1 || true
 }
 
 run_nmap_sv_one_udp() {
   local target="$1" port="$2" outfile="$3"
-  log "[*] nmap -sU -sV UDP ${target} -p ${port}"
+  log_info "nmap -sU -sV UDP ${target} -p ${port}"
   if [ "$EUID" -ne 0 ]; then
     sudo nmap -Pn -sU -sV -p "$port" -oN "$outfile" "$target" >/dev/null 2>&1 || true
   else
@@ -296,32 +362,30 @@ run_nmap_sv_one_udp() {
   fi
 }
 
-# -----------------------
-# webanalyze runner for one port
-# -----------------------
+# webanalyze runner for one port (80/443 only)
 run_webanalyze_one() {
   local scheme="$1" host="$2" port="$3" outdir="$4"
   local wa_out="$outdir/webanalyze_${port}.txt"
   if ! check_installed webanalyze; then
-    log "[!] webanalyze not installed; skipping."
+    log_warn "webanalyze not installed; skipping."
     return 1
   fi
   if [ ! -f "$WEBANALYZE_APP_JSON" ]; then
-    log "[!] technologies.json not found at $WEBANALYZE_APP_JSON; skipping."
+    log_warn "technologies.json not found at $WEBANALYZE_APP_JSON; skipping."
     return 1
   fi
-  log "[*] webanalyze ${scheme}://${host}:${port}"
 
+  local target_url
   if [ "$port" = "443" ]; then
     target_url="https://${host}"
   elif [ "$port" = "80" ]; then
     target_url="http://${host}"
   else
-    #target_url="${scheme}://${host}:${port}"
-    log "[!] Webanalyze - Only 80 and 443 are supported by this function; skipping."
+    log_warn "Webanalyze: Only 80 and 443 are supported here; skipping port $port."
     return 1
   fi
 
+  log_info "webanalyze ${target_url}"
   if [ "$EUID" -ne 0 ]; then
     sudo webanalyze -apps "$WEBANALYZE_APP_JSON" -host "$target_url" 2>/dev/null | tee "$wa_out" >/dev/null || true
   else
@@ -330,70 +394,90 @@ run_webanalyze_one() {
 
   local flat="$outdir/webanalyze_${port}.flat"
   flatten_webanalyze_full_versions "$wa_out" "$flat"
-  [ -s "$flat" ] && return 0 || return 2
+  if [ -s "$flat" ]; then
+    while IFS= read -r tech; do
+      [ -z "$tech" ] && continue
+      printf "web:%s -> %s\twebanalyze\n" "$port" "$tech" >> "$SERVICE_FINDINGS"
+      log_ok "Web tech (port $port): $tech (webanalyze)"
+    done < "$flat"
+    return 0
+  fi
+  return 2
 }
 
 # -----------------------
-# Discovery phase
+# Discovery phase (TCP)
 # -----------------------
 if [ "$DO_TCP" = "true" ]; then
   if [ "$MASSCAN_FIRST" = "true" ] && check_installed masscan; then
     run_masscan "$TARGET" "tcp" "$PORTS_TCP" "$RAW_MASS_TCP"
-    parse_masscan_to_ports "$RAW_MASS_TCP" "$PARSED_TCP"
+    parse_masscan_to_ports "$RAW_MASS_TCP" "$MASS_TCP_PORTS" "masscan"
   else
     run_nmap_simple "$TARGET" "tcp" "$PORTS_TCP" "$RAW_NMAP_TCP"
-    parse_nmap_ports "$RAW_NMAP_TCP" "$PARSED_TCP"
+    parse_nmap_ports "$RAW_NMAP_TCP" "$NMAP_TCP_PORTS" "nmap"
   fi
 fi
 
 # -----------------------
-# UDP discovery phase
+# Discovery phase (UDP)
 # -----------------------
 if [ "$DO_UDP" = "true" ]; then
   if [ "$MASSCAN_FIRST" = "true" ] && check_installed masscan; then
     run_masscan "$TARGET" "udp" "$PORTS_UDP" "$RAW_MASS_UDP"
-    parse_masscan_to_ports "$RAW_MASS_UDP" "$PARSED_UDP"
-    # augment with nmap UDP discovery (nmap may provide additional info)
+    parse_masscan_to_ports "$RAW_MASS_UDP" "$MASS_UDP_PORTS" "masscan"
+    # also try nmap UDP discovery to augment
     run_nmap_simple "$TARGET" "udp" "$PORTS_UDP" "$RAW_NMAP_UDP"
-    parse_nmap_ports "$RAW_NMAP_UDP" "$TMPDIR/nmap_udp_ports.txt"
-    cat "$TMPDIR/nmap_udp_ports.txt" >> "$PARSED_UDP" 2>/dev/null || true
-    sort -V -u "$PARSED_UDP" -o "$PARSED_UDP" || true
+    parse_nmap_ports "$RAW_NMAP_UDP" "$NMAP_UDP_PORTS" "nmap"
   else
     run_nmap_simple "$TARGET" "udp" "$PORTS_UDP" "$RAW_NMAP_UDP"
-    parse_nmap_ports "$RAW_NMAP_UDP" "$PARSED_UDP"
+    parse_nmap_ports "$RAW_NMAP_UDP" "$NMAP_UDP_PORTS" "nmap"
   fi
 fi
 
 # -----------------------
 # Combine and print final ports
 # -----------------------
-: > "$FINAL_PORTS"
+: > "$PARSED_TCP"; : > "$PARSED_UDP"; : > "$FINAL_PORTS"
+
+[ -s "$MASS_TCP_PORTS" ] && cat "$MASS_TCP_PORTS" >> "$PARSED_TCP"
+[ -s "$NMAP_TCP_PORTS" ] && cat "$NMAP_TCP_PORTS" >> "$PARSED_TCP"
+[ -s "$PARSED_TCP" ] && sort -V -u "$PARSED_TCP" -o "$PARSED_TCP"
+
+[ -s "$MASS_UDP_PORTS" ] && cat "$MASS_UDP_PORTS" >> "$PARSED_UDP"
+[ -s "$NMAP_UDP_PORTS" ] && cat "$NMAP_UDP_PORTS" >> "$PARSED_UDP"
+[ -s "$PARSED_UDP" ] && sort -V -u "$PARSED_UDP" -o "$PARSED_UDP"
+
 [ -s "$PARSED_TCP" ] && cat "$PARSED_TCP" >> "$FINAL_PORTS"
 [ -s "$PARSED_UDP" ] && cat "$PARSED_UDP" >> "$FINAL_PORTS"
-if [ -s "$FINAL_PORTS" ]; then
-  sort -V -u "$FINAL_PORTS" -o "$FINAL_PORTS" || true
-fi
+[ -s "$FINAL_PORTS" ] && sort -V -u "$FINAL_PORTS" -o "$FINAL_PORTS"
 
 if [ -n "$OUTFILE" ]; then
   cp "$FINAL_PORTS" "$OUTFILE" 2>/dev/null || true
-  [ -n "$OUTFILE" ] && log "[*] final ports written to: $OUTFILE"
+  [ -n "$OUTFILE" ] && log_info "final ports written to: $OUTFILE"
 fi
 
 if [ "$SCILENT" != "true" ]; then
   if [ -s "$FINAL_PORTS" ]; then
+    echo
     echo "==== Open ports (port/proto) ===="
     cat "$FINAL_PORTS"
   else
-    log "[!] No open ports discovered."
+    log_warn "No open ports discovered."
   fi
 fi
 
 # -----------------------
-# if --service-scan requested but no open ports -> exit early
+# If --service-scan requested but no open ports -> exit early
 # -----------------------
 if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
   if [ ! -s "$FINAL_PORTS" ]; then
-    log "[*] --service-scan requested but no open ports were discovered. Exiting (no service enumeration will be run)."
+    log_info "--service-scan requested but no open ports were discovered. Exiting."
+    # Still show a compact “who tried what” (ports) if any:
+    if [ -s "$PORT_FINDINGS" ]; then
+      echo
+      echo "==== Port findings (no open ports after dedupe) ===="
+      awk '{print $1" ["$2"]"}' "$PORT_FINDINGS" | sort -u
+    fi
     exit 0
   fi
 fi
@@ -416,7 +500,7 @@ if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
       [ -z "$p" ] && continue
       out="$TMPDIR/nmap_sV_tcp_${p}.txt"
       run_nmap_sv_one_tcp "$TARGET" "$p" "$out"
-      parse_nmap_services "$out" "${out}.parsed"
+      parse_nmap_services "$out" "${out}.parsed" "nmap -sV"
       [ -s "${out}.parsed" ] && cat "${out}.parsed" >> "$SERVICES_RAW"
     done < "$TMPDIR/tcp_elist.txt"
   fi
@@ -426,19 +510,9 @@ if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
       [ -z "$p" ] && continue
       out="$TMPDIR/nmap_sV_udp_${p}.txt"
       run_nmap_sv_one_udp "$TARGET" "$p" "$out"
-      parse_nmap_services "$out" "${out}.parsed"
+      parse_nmap_services "$out" "${out}.parsed" "nmap -sU -sV"
       [ -s "${out}.parsed" ] && cat "${out}.parsed" >> "$SERVICES_RAW"
     done < "$TMPDIR/udp_elist.txt"
-  fi
-
-  if [ -s "$SERVICES_RAW" ]; then
-    sort -V -u "$SERVICES_RAW" -o "$SERVICES_RAW" || true
-    echo
-    echo "==== Services discovered (port/proto -> service + banner) ===="
-    cat "$SERVICES_RAW"
-  else
-    echo
-    log "[!] No services discovered (nmap -sV returned nothing or nmap not installed)."
   fi
 
   # ---- auto webanalyze only for 80/tcp and 443/tcp ----
@@ -448,33 +522,59 @@ if [ "$SERVICE_SCAN_FLAG" = "true" ]; then
     grep -q '^443/tcp$' "$FINAL_PORTS" 2>/dev/null && have443=true
 
     if [ "$have80" = "true" ] || [ "$have443" = "true" ]; then
-      echo
-      log "[*] Running webanalyze using $WEBANALYZE_APP_JSON on open web ports..."
-      : > "$TMPDIR/web_techs_full.txt"
-
-      if [ "$have80" = "true" ];  then run_webanalyze_one "http"  "$TARGET" 80  "$WEBANALYZE_OUTDIR" || true; fi
-      if [ "$have443" = "true" ]; then run_webanalyze_one "https" "$TARGET" 443 "$WEBANALYZE_OUTDIR" || true; fi
-
-      # collect flats
-      for flat in "$WEBANALYZE_OUTDIR"/webanalyze_*.flat; do
-        [ -s "$flat" ] || continue
-        port="${flat##*_}"; port="${port%.flat}"
-        scheme="http"; [ "$port" = "443" ] && scheme="https"
-        echo "---- ${scheme}://${TARGET}:${port} ----" >> "$TMPDIR/web_techs_full.txt"
-        cat "$flat" >> "$TMPDIR/web_techs_full.txt"
-        echo >> "$TMPDIR/web_techs_full.txt"
-      done
-
-      if [ -s "$TMPDIR/web_techs_full.txt" ]; then
-        echo
-        echo "==== Web technologies (full versions only) ===="
-        cat "$TMPDIR/web_techs_full.txt"
-      else
-        log "[!] webanalyze produced no parsed results."
-      fi
+      log_info "Running webanalyze using $WEBANALYZE_APP_JSON on open web ports..."
+      [ "$have80" = "true" ]  && run_webanalyze_one "http"  "$TARGET" 80  "$WEBANALYZE_OUTDIR" || true
+      [ "$have443" = "true" ] && run_webanalyze_one "https" "$TARGET" 443 "$WEBANALYZE_OUTDIR" || true
     else
-      log "[*] Skipping webanalyze: neither 80/tcp nor 443/tcp were found open."
+      log_info "Skipping webanalyze: neither 80/tcp nor 443/tcp were found open."
     fi
+  fi
+
+  # -----------------------
+  # Summaries
+  # -----------------------
+  echo
+  echo "==== Port summary (deduped + sorted with sources) ===="
+  if [ -s "$FINAL_PORTS" ]; then
+    # For each final port, list unique tools that reported it
+    while read -r pp; do
+      tools=$(awk -v k="$pp" -F'\t' '$1==k {print $2}' "$PORT_FINDINGS" 2>/dev/null | sort -u | paste -sd',' -)
+      [ -n "$tools" ] || tools="(source unknown)"
+      printf "%-10s [%s]\n" "$pp" "$tools"
+    done < "$FINAL_PORTS"
+  else
+    echo "(none)"
+  fi
+
+  # Build deduped services with sources
+  if [ -s "$SERVICES_RAW" ] || [ -s "$SERVICE_FINDINGS" ]; then
+    # Normalize SERVICE_FINDINGS into SERVICES_WITH_SRC for final echo
+    # We want lines like: "port/proto -> service [tools]"
+    # SERVICE_FINDINGS keys may be "port -> svc banner" or "web:<port> -> Tech ver"
+    # We'll print exactly the left side + [tools]
+    awk -F'\t' '{print $1"\t"$2}' "$SERVICE_FINDINGS" 2>/dev/null \
+      | sort -u > "$TMPDIR/_svc_pairs.tsv" || true
+
+    # Aggregate tools per key
+    : > "$SERVICES_WITH_SRC"
+    while IFS=$'\t' read -r key tool; do
+      echo "$key	$tool"
+    done < "$TMPDIR/_svc_pairs.tsv" \
+      | awk -F'\t' '
+         { a[$1]=(a[$1]?a[$1]","$2:$2) }
+         END { for (k in a) print k "\t[" a[k] "]" }' \
+      | sort -V > "$SERVICES_WITH_SRC"
+  fi
+
+  echo
+  echo "==== Services discovered (deduped) ===="
+  if [ -s "$SERVICES_WITH_SRC" ]; then
+    # Pretty print: keep original "port -> svc banner" then [tools]
+    while IFS=$'\t' read -r left right; do
+      printf "%s %s\n" "$left" "$right"
+    done < "$SERVICES_WITH_SRC"
+  else
+    echo "(none)"
   fi
 fi
 
