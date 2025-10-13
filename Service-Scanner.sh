@@ -302,10 +302,10 @@ run_nmap_sv_one_udp() {
 run_webanalyze_one() {
   local scheme="$1" host="$2" port="$3" outdir="$4"
   local wa_out="$outdir/webanalyze_${port}.txt"
-  #if ! check_installed webanalyze; then
-  #  log "[!] webanalyze not installed; skipping."
-  #  return 1
-  #fi
+  if ! check_installed webanalyze; then
+    log "[!] webanalyze not installed; skipping."
+    return 1
+  fi
   if [ ! -f "$WEBANALYZE_APP_JSON" ]; then
     log "[!] technologies.json not found at $WEBANALYZE_APP_JSON; skipping."
     return 1
