@@ -37,28 +37,39 @@ unset _required_vars _missing m v
 # -----------------------
 log()     { printf "%s\n" "$*" >&2; }
 die()     { log "[ERROR] $*"; exit 1; }
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
+#check_installed() { command -v "$1" >/dev/null 2>&1; }
+
+# check if app is installed
+check_installed() {
+    local app="$1"
+    if which "$app" >/dev/null 2>&1; then
+        return 0    # true
+    else
+        return 1    # false
+    fi
+}
+
 
 print_help() {
   cat <<'EOF'
-service-scanner.sh - Port discovery + per-port service enumeration with nmap
+  service-scanner.sh - Port discovery + per-port service enumeration with nmap
 
-Usage: ./service-scanner.sh -t <target> [options]
+  Usage: ./service-scanner.sh -t <target> [options]
 
-Options (CLI overrides config.conf):
-  -t, --target <target>    Target IP/CIDR/hostname (overrides TARGET in config)
-  -T                       Scan TCP
-  -U                       Scan UDP
-  -TU                      Scan both TCP and UDP
-  -p, --ports <spec>       Port spec (overrides PORTS_SPEC), e.g. "80,443,8000-8100"
-  --rate <n>               masscan --rate (overrides RATE from config)
-  --port-scan              Discovery only (sets PORT_SCAN_FLAG=true)
-  --service-scan           Discovery + per-port nmap -sV (sets SERVICE_SCAN_FLAG=true)
-  --keep-tmp               Keep tmp directory after run
-  --debug                  Enable debug output (implies --keep-tmp)
-  -o, --output <file>      Save final ports list (overrides OUTFILE)
-  -s, --scilence           Do not print final ports to stdout
-  -h, --help               Show this help
+  Options (CLI overrides config.conf):
+    -t, --target <target>    Target IP/CIDR/hostname (overrides TARGET in config)
+    -T                       Scan TCP
+    -U                       Scan UDP
+    -TU                      Scan both TCP and UDP
+    -p, --ports <spec>       Port spec (overrides PORTS_SPEC), e.g. "80,443,8000-8100"
+    --rate <n>               masscan --rate (overrides RATE from config)
+    --port-scan              Discovery only (sets PORT_SCAN_FLAG=true)
+    --service-scan           Discovery + per-port nmap -sV (sets SERVICE_SCAN_FLAG=true)
+    --keep-tmp               Keep tmp directory after run
+    --debug                  Enable debug output (implies --keep-tmp)
+    -o, --output <file>      Save final ports list (overrides OUTFILE)
+    -s, --scilence           Do not print final ports to stdout
+    -h, --help               Show this help
 EOF
 }
 
@@ -288,7 +299,7 @@ run_nmap_sv_one_udp() {
 run_webanalyze_one() {
   local scheme="$1" host="$2" port="$3" outdir="$4"
   local wa_out="$outdir/webanalyze_${port}.txt"
-  if ! has_cmd webanalyze; then
+  if ! check_installed webanalyze; then
     log "[!] webanalyze not installed; skipping."
     return 1
   fi
@@ -321,7 +332,7 @@ run_webanalyze_one() {
 # Discovery phase
 # -----------------------
 if [ "$DO_TCP" = "true" ]; then
-  if [ "$MASSCAN_FIRST" = "true" ] && has_cmd masscan; then
+  if [ "$MASSCAN_FIRST" = "true" ] && check_installed masscan; then
     run_masscan "$TARGET" "tcp" "$PORTS_TCP" "$RAW_MASS_TCP"
     parse_masscan_to_ports "$RAW_MASS_TCP" "$PARSED_TCP"
   else
@@ -331,7 +342,7 @@ if [ "$DO_TCP" = "true" ]; then
 fi
 
 if [ "$DO_UDP" = "true" ]; then
-  if [ "$MASSCAN_FIRST" = "true" ] && has_cmd masscan; then
+  if [ "$MASSCAN_FIRST" = "true" ] && check_installed masscan; then
     run_masscan "$TARGET" "udp" "$PORTS_UDP" "$RAW_MASS_UDP"
     parse_masscan_to_ports "$RAW_MASS_UDP" "$PARSED_UDP"
     # augment with nmap UDP discovery (nmap may provide additional info)
