@@ -25,11 +25,11 @@ MASSCAN_FIRST=true
 WEBANALYZE_APP_JSON="./technologies.json"   # required file in current directory
 RUN_WEBANALYZE_ALWAYS=true                  # true: always try in --service-scan if 80/443 open
 
+# print help message with switche -h or --help
 print_help() {
   cat <<'EOF'
-service-scanner.sh - Port discovery + per-port service enumeration with nmap
-
-Options:
+  service-scanner.sh - Port discovery + per-port service enumeration with nmap
+  Options:
   -t, --target <target>   Target IP/CIDR/hostname (required)
   -T                      Scan TCP
   -U                      Scan UDP
